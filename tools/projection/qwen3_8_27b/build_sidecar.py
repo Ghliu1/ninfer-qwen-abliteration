@@ -21,7 +21,10 @@ from tools.artifact.numeric import decode_e2m1_word, decode_e4m3fn_word
 from tools.convert.qwen3_8_27b import inventory_nvfp4 as inventory
 
 from .sidecar import (
+    APPROVED_ARTIFACT_SHA256,
+    APPROVED_DIRECTION_SHA256,
     DIRECTION_COUNT,
+    PAYLOAD_ALIGNMENT,
     SidecarError,
     SidecarRecord,
     align_up,
@@ -86,6 +89,14 @@ def _normalized_direction(source, direction_key: str) -> torch.Tensor:
     if not bool(torch.isfinite(norm)) or float(norm) <= 0.0:
         raise SidecarError(f"direction {direction_key} has zero or invalid norm")
     return raw / norm
+
+
+def _canonical_f32_bytes(value: torch.Tensor) -> bytes:
+    """Serialize a CPU FP32 tensor in the sidecar's little-endian form."""
+
+    return value.detach().contiguous().to(torch.float32).numpy().astype(
+        "<f4", copy=False
+    ).tobytes()
 
 
 def _signature_fp8(payload, shape: tuple[int, int], direction: torch.Tensor) -> torch.Tensor:
@@ -187,9 +198,16 @@ def build_sidecar(
     artifact_path = Path(artifact_path)
     directions_path = Path(directions_path)
     output_path = Path(output_path)
-    source = load_direction_source(directions_path)
-    coefficients = dict(zip(source.keys, source.coefficients(), strict=True))
     artifact_digest = sha256_file(artifact_path)
+    if artifact_digest != APPROVED_ARTIFACT_SHA256:
+        raise SidecarError("artifact SHA-256 is not the approved Qwen3.8 artifact")
+    direction_digest = sha256_file(directions_path)
+    if direction_digest != APPROVED_DIRECTION_SHA256:
+        raise SidecarError("direction SHA-256 is not the approved Qwen3.8 source")
+    source = load_direction_source(directions_path)
+    if source.sha256 != direction_digest:
+        raise SidecarError("direction source changed while it was being loaded")
+    coefficients = dict(zip(source.keys, source.coefficients(), strict=True))
     if run_guard:
         _validate_storage_guard(Path(storage_root), Path(storage_guard))
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -208,7 +226,7 @@ def build_sidecar(
                     try:
                         payload_hash = hashlib.sha256(payload_view).hexdigest()
                         direction = _normalized_direction(source, direction_key)
-                        direction_bytes = direction.numpy().tobytes()
+                        direction_bytes = _canonical_f32_bytes(direction)
                         direction_offset = align_up(payload_offset, PAYLOAD_ALIGNMENT)
                         payload_offset = _append_aligned(payload_stream, payload_offset, direction_bytes)
                         signature = compute_signature(obj, payload_view, direction)

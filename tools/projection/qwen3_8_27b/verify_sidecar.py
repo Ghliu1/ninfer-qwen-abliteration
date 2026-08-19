@@ -19,6 +19,8 @@ from tools.artifact.numeric import decode_e2m1_word, decode_e4m3fn_word
 from tools.convert.qwen3_8_27b import inventory_nvfp4 as inventory
 
 from .sidecar import (
+    APPROVED_ARTIFACT_SHA256,
+    APPROVED_DIRECTION_SHA256,
     DIRECTION_COUNT,
     SidecarError,
     SidecarReader,
@@ -122,6 +124,14 @@ def _read_f32(view: memoryview, count: int, label: str) -> torch.Tensor:
     return tensor
 
 
+def _canonical_f32_bytes(value: torch.Tensor) -> bytes:
+    """Serialize a CPU FP32 tensor in the sidecar's little-endian form."""
+
+    return value.detach().contiguous().to(torch.float32).numpy().astype(
+        "<f4", copy=False
+    ).tobytes()
+
+
 def _recompute_fp8(payload, shape: tuple[int, int], direction: torch.Tensor) -> torch.Tensor:
     codes, row_scales = decode_fp8_row_scaled_words(payload, shape)
     rows, columns = shape
@@ -214,6 +224,10 @@ def verify_sidecar(
 
     sidecar_path = Path(sidecar_path)
     with SidecarReader(sidecar_path) as reader:
+        if reader.artifact_sha256 != APPROVED_ARTIFACT_SHA256:
+            raise SidecarError("sidecar artifact SHA-256 is not the approved Qwen3.8 artifact")
+        if reader.direction_sha256 != APPROVED_DIRECTION_SHA256:
+            raise SidecarError("sidecar direction SHA-256 is not the approved Qwen3.8 source")
         expected_keys = _expected_writer_keys_independent()
         actual_keys = [record.key for record in reader.manifest]
         expected_set = set(expected_keys)
@@ -231,23 +245,36 @@ def verify_sidecar(
         if actual_keys != list(expected_keys):
             raise SidecarError("projection inventory order mismatch")
 
+        if directions_path is None:
+            candidate = sidecar_path.parent / "refusal_dirs_qwen38.safetensors"
+            directions_path = candidate
+        directions_path = Path(directions_path)
+        direction_digest = sha256_file(directions_path)
+        if direction_digest != APPROVED_DIRECTION_SHA256:
+            raise SidecarError("direction SHA-256 is not the approved Qwen3.8 source")
+        source = load_direction_source(directions_path)
+        if source.sha256 != direction_digest:
+            raise SidecarError("direction source changed while it was being loaded")
+
         if isinstance(artifact, Artifact):
             artifact_context = artifact
             owns_artifact = False
+            artifact_path = artifact_context.path
+            artifact_digest = sha256_file(artifact_path)
         else:
-            artifact_context = Artifact.open(artifact)
+            artifact_path = Path(artifact)
+            artifact_digest = sha256_file(artifact_path)
+            if artifact_digest != APPROVED_ARTIFACT_SHA256:
+                raise SidecarError("artifact SHA-256 is not the approved Qwen3.8 artifact")
+            artifact_context = Artifact.open(artifact_path)
             owns_artifact = True
+        if artifact_digest != APPROVED_ARTIFACT_SHA256:
+            raise SidecarError("artifact SHA-256 is not the approved Qwen3.8 artifact")
         try:
             if artifact_context.identity.model_id != "qwen3.8-27b" or artifact_context.identity.weights_id != "nvfp4":
                 raise SidecarError("artifact identity does not match qwen3.8-27b/nvfp4")
-            artifact_path = artifact_context.path
-            artifact_digest = sha256_file(artifact_path)
             if artifact_digest != reader.artifact_sha256:
                 raise SidecarError("sidecar artifact SHA-256 does not match the supplied artifact")
-            if directions_path is None:
-                candidate = sidecar_path.parent / "refusal_dirs_qwen38.safetensors"
-                directions_path = candidate
-            source = load_direction_source(directions_path)
             if source.sha256 != reader.direction_sha256:
                 raise SidecarError("sidecar direction SHA-256 does not match the supplied directions")
             coefficients = dict(zip(source.keys, source.coefficients(), strict=True))
@@ -285,24 +312,21 @@ def verify_sidecar(
                 if not bool(torch.isfinite(norm)) or float(norm) <= 0.0:
                     raise SidecarError(f"direction {direction_key} has zero or invalid norm")
                 expected_direction = raw_direction / norm
-                stored_direction = _read_f32(
-                    reader.record_payload(record, "direction"),
-                    DIRECTION_COUNT,
-                    f"sidecar direction {record.key}",
-                )
+                stored_direction_view = reader.record_payload(record, "direction")
                 try:
-                    torch.testing.assert_close(
-                        stored_direction,
-                        expected_direction,
-                        rtol=1e-5,
-                        atol=1e-5,
+                    if bytes(stored_direction_view) != _canonical_f32_bytes(expected_direction):
+                        raise SidecarError(f"direction identity mismatch for {record.key}")
+                    stored_direction = _read_f32(
+                        stored_direction_view,
+                        DIRECTION_COUNT,
+                        f"sidecar direction {record.key}",
                     )
-                except AssertionError as exc:
-                    raise SidecarError(f"direction mismatch for {record.key}: {exc}") from exc
+                finally:
+                    stored_direction_view.release()
                 stored_norm = torch.linalg.vector_norm(stored_direction)
                 if not bool(torch.isfinite(stored_norm)) or abs(float(stored_norm) - 1.0) > 1e-5:
                     raise SidecarError(f"sidecar direction is not unit length for {record.key}")
-                expected_signature = _recompute_signature(obj, payload, expected_direction)
+                expected_signature = _recompute_signature(obj, payload, stored_direction)
                 stored_signature = _read_f32(
                     reader.record_payload(record, "signature"),
                     int(obj.shape[1]),

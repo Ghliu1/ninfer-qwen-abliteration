@@ -27,6 +27,12 @@ PAYLOAD_ALIGNMENT = 4096
 FP32_BYTES = 4
 DIRECTION_COUNT = 5120
 WRITER_COUNT = 128
+APPROVED_ARTIFACT_SHA256 = (
+    "bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32"
+)
+APPROVED_DIRECTION_SHA256 = (
+    "9de12cbe71f38baf2f6b4a21dfcb2b13bd6416ab4785214afce27c7543f05c1d"
+)
 
 _RECORD_FIELDS = frozenset(
     {
@@ -337,6 +343,7 @@ def _canonical_manifest(records: Sequence[SidecarRecord]) -> bytes:
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
 
 
@@ -364,9 +371,15 @@ def write_sidecar(
     """Write a sidecar via a same-directory fsync + atomic rename."""
 
     output = Path(path)
-    records = tuple(records)
-    if len(records) != WRITER_COUNT:
+    raw_records = tuple(records)
+    if len(raw_records) != WRITER_COUNT:
         raise SidecarError(f"sidecar must contain {WRITER_COUNT} records")
+    # Validate the dataclass values through the same strict JSON contract used
+    # by the reader.  This rejects NaN/Infinity before a temporary file exists,
+    # so a failed publication cannot replace an existing final sidecar.
+    records = tuple(
+        SidecarRecord.from_json(record.to_json()) for record in raw_records
+    )
     if len({record.key for record in records}) != len(records):
         raise SidecarError("sidecar contains duplicate projection records")
     manifest = _canonical_manifest(records)
@@ -408,6 +421,10 @@ def write_sidecar(
                 stream.write(chunk)
             stream.flush()
             os.fsync(stream.fileno())
+        # Reopen and fully validate the sibling before making it visible.  If
+        # this fails, the existing final path is left byte-identical.
+        temporary_reader = SidecarReader(temporary)
+        temporary_reader.close()
         os.replace(temporary, output)
         try:
             directory_fd = os.open(output.parent, os.O_RDONLY)
@@ -582,6 +599,8 @@ def load_direction_source(path: str | Path) -> DirectionSource:
 
 __all__ = [
     "DIRECTION_COUNT",
+    "APPROVED_ARTIFACT_SHA256",
+    "APPROVED_DIRECTION_SHA256",
     "DirectionSource",
     "HEADER",
     "MAGIC",
