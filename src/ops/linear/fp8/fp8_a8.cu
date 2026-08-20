@@ -16,16 +16,19 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <class ActivationGeometry, int Threads = 256>
+template <class ActivationGeometry, bool Score, int Threads = 256>
 __global__ __launch_bounds__(Threads,
                              2) void fp8_a8_quantize_kernel(const __nv_bfloat16* __restrict__ input,
                                                             std::uint8_t* __restrict__ codes,
-                                                            float* __restrict__ scales) {
+                                                            float* __restrict__ scales,
+                                                            const float* __restrict__ signature,
+                                                            float* __restrict__ scores) {
     static_assert((ActivationGeometry::kInputRows % (Threads * 2)) == 0);
     constexpr int pairs_per_token  = ActivationGeometry::kInputRows / 2;
     constexpr int pairs_per_thread = pairs_per_token / Threads;
     constexpr int warps            = Threads / 32;
     __shared__ float warp_maxima[warps];
+    __shared__ float warp_scores[warps];
     __shared__ float token_scale;
 
     const int token         = static_cast<int>(blockIdx.x);
@@ -59,12 +62,32 @@ __global__ __launch_bounds__(Threads,
     const float scale   = token_scale;
     const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
 #pragma unroll
+    float local_score = 0.0F;
     for (int item = 0; item < pairs_per_thread; ++item) {
         const int pair      = tid + item * Threads;
         const float2 scaled = make_float2(values[item].x * inverse, values[item].y * inverse);
-        output_pairs[pair]  = __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
+        const std::uint16_t encoded =
+            __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
+        output_pairs[pair] = encoded;
+        if constexpr (Score) {
+            __nv_fp8x2_e4m3 quantized;
+            quantized.__x = encoded;
+            const float2 effective = static_cast<float2>(quantized);
+            local_score += signature[pair * 2] * effective.x * scale;
+            local_score += signature[pair * 2 + 1] * effective.y * scale;
+        }
     }
     if (tid == 0) { scales[token] = scale; }
+    if constexpr (Score) {
+        local_score = warp_reduce_sum(local_score);
+        if (lane == 0) { warp_scores[warp] = local_score; }
+        __syncthreads();
+        if (warp == 0) {
+            local_score = lane < warps ? warp_scores[lane] : 0.0F;
+            local_score = warp_reduce_sum<warps>(local_score);
+            if (lane == 0) { scores[token] = local_score; }
+        }
+    }
 }
 
 template <class Geometry, class Schedule, bool FullTokens>
@@ -92,11 +115,13 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class ActivationGeometry>
-void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream_t stream) {
+template <class ActivationGeometry, bool Score>
+void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, const float* signature,
+                           float* scores, cudaStream_t stream) {
     constexpr int kThreads = 256;
-    fp8_a8_quantize_kernel<ActivationGeometry, kThreads><<<x.ne[1], kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales);
+    fp8_a8_quantize_kernel<ActivationGeometry, Score, kThreads>
+        <<<x.ne[1], kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                                          workspace.codes, workspace.scales, signature, scores);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -120,16 +145,44 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
     }
     switch (weight.k) {
     case Fp8Activation5120Geometry::kInputRows:
-        launch_quantize_exact<Fp8Activation5120Geometry>(x, workspace, stream);
+        launch_quantize_exact<Fp8Activation5120Geometry, false>(x, workspace, nullptr, nullptr,
+                                                                 stream);
         return;
     case Fp8Activation6144Geometry::kInputRows:
-        launch_quantize_exact<Fp8Activation6144Geometry>(x, workspace, stream);
+        launch_quantize_exact<Fp8Activation6144Geometry, false>(x, workspace, nullptr, nullptr,
+                                                                 stream);
         return;
     case Fp8Activation17408Geometry::kInputRows:
-        launch_quantize_exact<Fp8Activation17408Geometry>(x, workspace, stream);
+        launch_quantize_exact<Fp8Activation17408Geometry, false>(x, workspace, nullptr, nullptr,
+                                                                  stream);
         return;
     default:
         throw std::invalid_argument("fp8 A8 quantize: unsupported K");
+    }
+}
+
+void launch_fp8_a8_quantize_scored(const Tensor& x, const Weight& weight,
+                                   Fp8A8Workspace workspace, const float* signature,
+                                   float* scores, cudaStream_t stream) {
+    if (workspace.codes == nullptr || workspace.scales == nullptr || signature == nullptr ||
+        scores == nullptr) {
+        throw std::invalid_argument("fp8 A8 scored quantize requires caller workspace/signature");
+    }
+    switch (weight.k) {
+    case Fp8Activation5120Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation5120Geometry, true>(x, workspace, signature, scores,
+                                                                stream);
+        return;
+    case Fp8Activation6144Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation6144Geometry, true>(x, workspace, signature, scores,
+                                                                stream);
+        return;
+    case Fp8Activation17408Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation17408Geometry, true>(x, workspace, signature, scores,
+                                                                 stream);
+        return;
+    default:
+        throw std::invalid_argument("fp8 A8 scored quantize: unsupported K");
     }
 }
 

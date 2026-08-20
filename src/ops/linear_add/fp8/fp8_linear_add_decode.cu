@@ -14,30 +14,44 @@ namespace ninfer::ops::detail {
 namespace {
 
 template <class Geometry>
-void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
+void launch(const Tensor& x, const Weight& weight, Tensor& residual,
+            const ResidualProjectionView* projection, const float* scores, cudaStream_t stream) {
     using Schedule        = typename Fp8LinearDecodeProductionSchedule<Geometry>::Type;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     auto* output          = static_cast<__nv_bfloat16*>(residual.data);
     const Fp8ContiguousOutput destination{output, Geometry::kOutputRows};
     const Fp8GemvIdentityRows rows{};
-    const Fp8AddResidualEpilogue epilogue{output, Geometry::kOutputRows};
-    fp8_gemv_kernel<Geometry, Schedule, Fp8ContiguousOutput, Fp8GemvIdentityRows, false,
-                    Fp8AddResidualEpilogue><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const __nv_bfloat16*>(weight.scales), destination, rows, epilogue);
+    if (projection == nullptr) {
+        const Fp8AddResidualEpilogue epilogue{output, Geometry::kOutputRows};
+        fp8_gemv_kernel<Geometry, Schedule, Fp8ContiguousOutput, Fp8GemvIdentityRows, false,
+                        Fp8AddResidualEpilogue><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const __nv_bfloat16*>(weight.scales), destination, rows, epilogue);
+    } else {
+        const Fp8ProjectedAddResidualEpilogue epilogue{
+            output, Geometry::kOutputRows, projection->direction, scores, projection->coefficient};
+        fp8_gemv_kernel<Geometry, Schedule, Fp8ContiguousOutput, Fp8GemvIdentityRows, false,
+                        Fp8ProjectedAddResidualEpilogue>
+            <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const __nv_bfloat16*>(weight.scales), destination, rows, epilogue);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
 void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                  const ResidualProjectionView* projection, const float* scores,
                                   cudaStream_t stream) {
     switch (resolve_fp8_problem(weight.n, weight.k)) {
     case Fp8Problem::Residual6144:
-        launch<Fp8Residual6144Geometry>(x, weight, residual, stream);
+        launch<Fp8Residual6144Geometry>(x, weight, residual, projection, scores, stream);
         return;
     case Fp8Problem::Residual17408:
-        launch<Fp8Residual17408Geometry>(x, weight, residual, stream);
+        launch<Fp8Residual17408Geometry>(x, weight, residual, projection, scores, stream);
         return;
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:

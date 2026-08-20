@@ -14,7 +14,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+using Launch = void (*)(const Tensor&, const Weight&, Tensor&, const ResidualProjectionView*,
+                        const float*, cudaStream_t);
 
 template <class Geometry, int ActiveTokens>
 struct Fp8LinearAddSmallTProductionSchedule;
@@ -63,18 +64,32 @@ struct Fp8LinearAddSmallTProductionSchedule<Fp8Residual17408Geometry, ActiveToke
 };
 
 template <class Geometry, int ActiveTokens>
-void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
+void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual,
+                  const ResidualProjectionView* projection, const float* scores,
+                  cudaStream_t stream) {
     using Schedule = typename Fp8LinearAddSmallTProductionSchedule<Geometry, ActiveTokens>::Type;
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
     auto* output              = static_cast<__nv_bfloat16*>(residual.data);
-    fp8_small_t_kernel<Geometry, ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const __nv_bfloat16*>(weight.scales),
-            Fp8ContiguousOutput{output, Geometry::kOutputRows},
-            Fp8AddResidualEpilogue{output, Geometry::kOutputRows});
+    if (projection == nullptr) {
+        fp8_small_t_kernel<Geometry, ActiveTokens, Schedule>
+            <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const __nv_bfloat16*>(weight.scales),
+                Fp8ContiguousOutput{output, Geometry::kOutputRows},
+                Fp8AddResidualEpilogue{output, Geometry::kOutputRows});
+    } else {
+        fp8_small_t_kernel<Geometry, ActiveTokens, Schedule>
+            <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const __nv_bfloat16*>(weight.scales),
+                Fp8ContiguousOutput{output, Geometry::kOutputRows},
+                Fp8ProjectedAddResidualEpilogue{output, Geometry::kOutputRows,
+                                                 projection->direction, scores,
+                                                 projection->coefficient});
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -94,6 +109,7 @@ const auto& launchers() {
 } // namespace
 
 void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                   const ResidualProjectionView* projection, const float* scores,
                                    cudaStream_t stream) {
     if (x.ne[1] < kFp8FirstSmallT || x.ne[1] > kFp8LastSmallT) {
         throw std::invalid_argument("fp8 linear_add small-T: unsupported T");
@@ -101,10 +117,12 @@ void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor
     const std::size_t index = static_cast<std::size_t>(x.ne[1] - kFp8FirstSmallT);
     switch (resolve_fp8_problem(weight.n, weight.k)) {
     case Fp8Problem::Residual6144:
-        launchers<Fp8Residual6144Geometry>()[index](x, weight, residual, stream);
+        launchers<Fp8Residual6144Geometry>()[index](x, weight, residual, projection, scores,
+                                                    stream);
         return;
     case Fp8Problem::Residual17408:
-        launchers<Fp8Residual17408Geometry>()[index](x, weight, residual, stream);
+        launchers<Fp8Residual17408Geometry>()[index](x, weight, residual, projection, scores,
+                                                     stream);
         return;
     case Fp8Problem::AttnInput:
     case Fp8Problem::GdnInput:

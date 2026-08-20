@@ -53,6 +53,10 @@ inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,
 void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4Workspace workspace,
                                 cudaStream_t stream);
 
+void launch_nvfp4_w4a4_quantize_scored(const Tensor& x, const Weight& weight,
+                                       Nvfp4W4a4Workspace workspace, const float* signature,
+                                       float* scores, cudaStream_t stream);
+
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream);
 

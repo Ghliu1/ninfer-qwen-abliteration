@@ -2,6 +2,7 @@
 
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/common/warp.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
 
@@ -404,6 +405,41 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_ke
         codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
     store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
     scales[static_cast<std::int64_t>(token) * kGroupsPerRow + group] = quantized.scale;
+}
+
+template <class Geometry, int Threads = 256>
+__global__ __launch_bounds__(Threads, 2) void nvfp4_w4a4_quantize_scored_kernel(
+    const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
+    std::uint8_t* __restrict__ scales, float input_scale_divisor,
+    const float* __restrict__ signature, float* __restrict__ scores) {
+    static_assert(Threads == 256);
+    constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
+    __shared__ float warp_sums[Threads / 32];
+    const int token = static_cast<int>(blockIdx.x);
+    float local_score = 0.0F;
+    for (int group = static_cast<int>(threadIdx.x); group < kGroupsPerRow; group += Threads) {
+        const Nvfp4QuantizedK16 quantized = quantize_nvfp4_k16(
+            input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
+            input_scale_divisor);
+        auto* code_destination =
+            codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
+        store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
+        scales[static_cast<std::int64_t>(token) * kGroupsPerRow + group] = quantized.scale;
+
+        const float scale = decode_nvfp4_e4m3(quantized.scale) / input_scale_divisor;
+        const std::uint64_t packed = static_cast<std::uint64_t>(quantized.codes_lo) |
+                                     (static_cast<std::uint64_t>(quantized.codes_hi) << 32);
+#pragma unroll
+        for (int pair = 0; pair < 8; ++pair) {
+            const auto code = static_cast<std::uint8_t>((packed >> (pair * 8)) & 0xffU);
+            const float2 decoded = decode_nvfp4_e2m1x2(code);
+            const int column = group * 16 + pair * 2;
+            local_score += signature[column] * decoded.x * scale;
+            local_score += signature[column + 1] * decoded.y * scale;
+        }
+    }
+    const float score = block_reduce_sum<Threads>(local_score, warp_sums);
+    if (threadIdx.x == 0) { scores[token] = score; }
 }
 
 } // namespace ninfer::ops::detail

@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/projection/residual_projection.h"
 
 #include <cuda_runtime.h>
 
@@ -18,13 +19,17 @@ namespace ninfer::ops::detail {
                                                                   std::int32_t max_tokens);
 
 void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                  const ResidualProjectionView* projection, const float* scores,
                                   cudaStream_t stream);
 void fp8_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                   const ResidualProjectionView* projection, const float* scores,
                                    cudaStream_t stream);
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                              WorkspaceArena& workspace, cudaStream_t stream);
+                              WorkspaceArena& workspace,
+                              const ResidualProjectionView* projection, cudaStream_t stream);
 
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
-                             LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
+                             LinearPolicy policy, const ResidualProjectionView* projection,
+                             WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

@@ -108,6 +108,40 @@ void launch_nvfp4_w4a4_quantize(const Tensor& x, const Weight& weight, Nvfp4W4a4
     }
 }
 
+void launch_nvfp4_w4a4_quantize_scored(const Tensor& x, const Weight& weight,
+                                       Nvfp4W4a4Workspace workspace, const float* signature,
+                                       float* scores, cudaStream_t stream) {
+    if (workspace.codes == nullptr || workspace.scales == nullptr || signature == nullptr ||
+        scores == nullptr) {
+        throw std::invalid_argument(
+            "nvfp4 W4A4 scored quantize requires caller workspace/signature");
+    }
+    constexpr int kThreads = 256;
+    switch (weight.k) {
+    case Nvfp4Activation5120Geometry::kInputRows:
+        nvfp4_w4a4_quantize_scored_kernel<Nvfp4Activation5120Geometry>
+            <<<x.ne[1], kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales,
+                weight.input_scale_divisor, signature, scores);
+        break;
+    case Nvfp4Activation6144Geometry::kInputRows:
+        nvfp4_w4a4_quantize_scored_kernel<Nvfp4Activation6144Geometry>
+            <<<x.ne[1], kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales,
+                weight.input_scale_divisor, signature, scores);
+        break;
+    case Nvfp4Activation17408Geometry::kInputRows:
+        nvfp4_w4a4_quantize_scored_kernel<Nvfp4Activation17408Geometry>
+            <<<x.ne[1], kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales,
+                weight.input_scale_divisor, signature, scores);
+        break;
+    default:
+        throw std::invalid_argument("nvfp4 W4A4 scored quantize: unsupported K");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_nvfp4_w4a4(const Tensor& x, const Weight& weight, Tensor& out,
                        Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);

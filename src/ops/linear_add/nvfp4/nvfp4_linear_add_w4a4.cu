@@ -20,43 +20,68 @@ constexpr std::int32_t kTmaBlockM = 256;
 
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace workspace,
-                 std::int32_t tokens, cudaStream_t stream) {
+                 std::int32_t tokens, const ResidualProjectionView* projection,
+                 const float* scores, cudaStream_t stream) {
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN,
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
     auto* output      = static_cast<__nv_bfloat16*>(residual.data);
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
-        activation, static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
-        Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},
-        Nvfp4ContiguousOutput{output, Geometry::kOutputRows});
+    if (projection == nullptr) {
+        nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
+            activation, static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
+            Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},
+            Nvfp4ContiguousOutput{output, Geometry::kOutputRows});
+    } else {
+        nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
+            activation, static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
+            Nvfp4ProjectedAddResidualEpilogue{output, Geometry::kOutputRows,
+                                               projection->direction, scores,
+                                               projection->coefficient},
+            Nvfp4ContiguousOutput{output, Geometry::kOutputRows});
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace workspace,
-                    std::int32_t tokens, cudaStream_t stream) {
+                    std::int32_t tokens, const ResidualProjectionView* projection,
+                    const float* scores, cudaStream_t stream) {
     if (tokens <= 64) {
-        launch_gemm<Geometry, M32N64>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M32N64>(weight, residual, workspace, tokens, projection, scores,
+                                      stream);
     } else if (tokens <= 128) {
-        launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, projection, scores,
+                                       stream);
     } else if (tokens <= 192) {
-        launch_gemm<Geometry, M64N128>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M64N128>(weight, residual, workspace, tokens, projection, scores,
+                                       stream);
     } else if (tokens <= 384) {
-        launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, projection,
+                                                scores, stream);
     } else if (tokens <= 512) {
-        launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, projection,
+                                                 scores, stream);
     } else {
-        launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, stream);
+        launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, projection,
+                                                scores, stream);
     }
 }
 
 } // namespace
 
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
-                                  Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
-    launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
+                                  Nvfp4W4a4Workspace workspace,
+                                  const ResidualProjectionView* projection, float* scores,
+                                  cudaStream_t stream) {
+    if (projection == nullptr) {
+        launch_nvfp4_w4a4_quantize(x, weight, workspace, stream);
+    } else {
+        launch_nvfp4_w4a4_quantize_scored(x, weight, workspace, projection->signature, scores,
+                                           stream);
+    }
     const std::int32_t tokens  = x.ne[1];
     const Nvfp4Problem problem = resolve_nvfp4_problem(weight.n, weight.k);
     if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
@@ -65,15 +90,17 @@ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
                                          static_cast<const std::uint8_t*>(weight.qdata),
                                          static_cast<const std::uint8_t*>(weight.scales),
                                          static_cast<__nv_bfloat16*>(residual.data), tokens, alpha,
-                                         stream);
+                                         projection, scores, stream);
         return;
     }
     switch (problem) {
     case Nvfp4Problem::Residual6144:
-        launch_problem<Nvfp4Residual6144Geometry>(weight, residual, workspace, tokens, stream);
+        launch_problem<Nvfp4Residual6144Geometry>(weight, residual, workspace, tokens, projection,
+                                                  scores, stream);
         return;
     case Nvfp4Problem::Residual17408:
-        launch_problem<Nvfp4Residual17408Geometry>(weight, residual, workspace, tokens, stream);
+        launch_problem<Nvfp4Residual17408Geometry>(weight, residual, workspace, tokens, projection,
+                                                   scores, stream);
         return;
     case Nvfp4Problem::AttnInput:
     case Nvfp4Problem::GdnInput:

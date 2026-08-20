@@ -2,6 +2,7 @@
 
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
+#include "projection/residual_projection_kernels.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -31,7 +32,9 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
     return tokens >= first_a8 ? Fp8LinearAddRoute::A8 : Fp8LinearAddRoute::A16;
 }
 
-void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
+void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual,
+                const ResidualProjectionView* projection, const float* scores,
+                cudaStream_t stream) {
     for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kFp8LastSmallT) {
         const std::int32_t active = std::min(kFp8LastSmallT, x.ne[1] - token_begin);
         auto* input               = static_cast<std::uint8_t*>(x.data) +
@@ -41,9 +44,13 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStr
         Tensor input_chunk(input, DType::BF16, {weight.k, active});
         Tensor residual_chunk(output, DType::BF16, {weight.n, active});
         if (active == 1) {
-            fp8_linear_add_decode_launch(input_chunk, weight, residual_chunk, stream);
+            fp8_linear_add_decode_launch(input_chunk, weight, residual_chunk, projection,
+                                          scores == nullptr ? nullptr : scores + token_begin,
+                                          stream);
         } else {
-            fp8_linear_add_small_t_launch(input_chunk, weight, residual_chunk, stream);
+            fp8_linear_add_small_t_launch(input_chunk, weight, residual_chunk, projection,
+                                           scores == nullptr ? nullptr : scores + token_begin,
+                                           stream);
         }
     }
 }
@@ -64,13 +71,20 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 }
 
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
-                             LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
+                             LinearPolicy policy, const ResidualProjectionView* projection,
+                             WorkspaceArena& workspace, cudaStream_t stream) {
     const Fp8LinearAddRoute route = resolve_route(weight.n, weight.k, policy, x.ne[1]);
     if (route == Fp8LinearAddRoute::A16) {
-        launch_a16(x, weight, residual, stream);
+        if (projection == nullptr) {
+            launch_a16(x, weight, residual, nullptr, nullptr, stream);
+        } else {
+            auto scope = workspace.scope();
+            float* scores = projection_score_a16(*projection, x, x.ne[1], stream, workspace);
+            launch_a16(x, weight, residual, projection, scores, stream);
+        }
         return;
     }
-    fp8_linear_add_a8_launch(x, weight, residual, workspace, stream);
+    fp8_linear_add_a8_launch(x, weight, residual, workspace, projection, stream);
 }
 
 } // namespace ninfer::ops::detail

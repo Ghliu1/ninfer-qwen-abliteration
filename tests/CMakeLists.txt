@@ -300,6 +300,9 @@ ninfer_add_op_test(ninfer_linear_add_nvfp4_test
 ninfer_add_op_test(ninfer_linear_add_fp8_test
   SOURCES ops/linear_add/test_fp8.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(residual_projection_op_test
+  SOURCES projection/residual_projection_op_test.cu
+  LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
   ninfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp

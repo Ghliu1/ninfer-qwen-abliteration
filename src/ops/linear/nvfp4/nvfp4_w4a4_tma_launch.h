@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/linear/nvfp4/nvfp4_config.h"
+#include "ninfer/projection/residual_projection.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -32,6 +33,8 @@ void launch_nvfp4_w4a4_tma_linear_add(Nvfp4Problem problem, const std::uint8_t* 
                                       const std::uint8_t* activation_scales,
                                       const std::uint8_t* weight_codes,
                                       const std::uint8_t* weight_scales, __nv_bfloat16* residual,
-                                      std::int32_t tokens, float alpha, cudaStream_t stream);
+                                      std::int32_t tokens, float alpha,
+                                      const ResidualProjectionView* projection,
+                                      const float* scores, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

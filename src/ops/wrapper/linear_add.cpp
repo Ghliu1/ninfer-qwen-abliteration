@@ -11,6 +11,7 @@
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
 #include <cstdint>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -67,6 +68,19 @@ void validate_policy(LinearPolicy policy) {
         return;
     }
     throw std::invalid_argument("linear_add: invalid compute policy");
+}
+
+void validate_projection(const ResidualProjectionView* projection, const Weight& weight) {
+    if (projection == nullptr) { return; }
+    if (weight.qtype != QType::FP8_E4M3FN_ROW_BF16S && weight.qtype != QType::NVFP4) {
+        throw std::invalid_argument("linear_add: projected route is unsupported for weight format");
+    }
+    if (projection->direction == nullptr || projection->signature == nullptr ||
+        projection->direction_count != static_cast<std::uint32_t>(weight.n) ||
+        projection->signature_count != static_cast<std::uint32_t>(weight.k) ||
+        !std::isfinite(projection->coefficient)) {
+        throw std::invalid_argument("linear_add: invalid residual projection view");
+    }
 }
 
 } // namespace
@@ -135,12 +149,25 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, WorkspaceArena& ws,
                 cudaStream_t stream) {
-    linear_add(x, w, residual_out, LinearPolicy::A16Only, ws, stream);
+    linear_add(x, w, residual_out, LinearPolicy::A16Only, nullptr, ws, stream);
 }
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream) {
+    linear_add(x, w, residual_out, policy, nullptr, ws, stream);
+}
+
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
+                const ResidualProjectionView* projection, WorkspaceArena& ws,
+                cudaStream_t stream) {
+    linear_add(x, w, residual_out, LinearPolicy::A16Only, projection, ws, stream);
+}
+
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPolicy policy,
+                const ResidualProjectionView* projection, WorkspaceArena& ws,
+                cudaStream_t stream) {
     validate_policy(policy);
+    validate_projection(projection, w);
     const std::int32_t t = x.ne[1];
     if (t <= 0) { throw std::invalid_argument("linear_add: T must be positive"); }
     require_tensor(x, DType::BF16, w.k, t, "x");
@@ -216,7 +243,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: NVFP4 requires 16-byte x/residual alignment");
         }
-        detail::nvfp4_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        detail::nvfp4_linear_add_dispatch(x, w, residual_out, policy, projection, ws, stream);
         return;
     }
 
@@ -235,7 +262,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
-        detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        detail::fp8_linear_add_dispatch(x, w, residual_out, policy, projection, ws, stream);
         return;
     }
 

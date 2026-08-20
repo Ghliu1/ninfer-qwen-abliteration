@@ -16,4 +16,19 @@ struct Nvfp4AddResidualEpilogue {
     }
 };
 
+struct Nvfp4ProjectedAddResidualEpilogue {
+    const __nv_bfloat16* residual;
+    std::int32_t rows;
+    const float* direction;
+    const float* scores;
+    float coefficient;
+
+    __device__ __forceinline__ float apply(std::int32_t row, std::int32_t token,
+                                           float value) const {
+        const float corrected = value - coefficient * direction[row] * scores[token];
+        return corrected +
+               __bfloat162float(residual[static_cast<std::int64_t>(token) * rows + row]);
+    }
+};
+
 } // namespace ninfer::ops::detail

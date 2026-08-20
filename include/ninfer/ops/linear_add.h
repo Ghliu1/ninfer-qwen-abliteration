@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/projection/residual_projection.h"
 
 #include <cuda_runtime.h>
 
@@ -71,5 +72,18 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream);
+
+/**
+ * Projection-aware residual writer. A null projection is exactly the ordinary LinearAdd path.
+ * A non-null projection is supported only by the registered FP8 and NVFP4 residual routes and
+ * consumes exactly one additional FP32 score per token from caller-owned workspace.
+ */
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual,
+                const ResidualProjectionView* projection, WorkspaceArena& ws,
+                cudaStream_t stream);
+
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
+                const ResidualProjectionView* projection, WorkspaceArena& ws,
+                cudaStream_t stream);
 
 } // namespace ninfer::ops
