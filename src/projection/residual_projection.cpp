@@ -1,12 +1,12 @@
 #include <ninfer/projection/residual_projection.h>
 
 #include "core/arena.h"
+#include "projection/sha256.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -30,11 +30,16 @@ constexpr std::uint32_t kSchemaVersion   = 1;
 constexpr std::uint64_t kPayloadAlignment = 4096;
 constexpr std::uint64_t kMaximumManifestBytes = 1ULL << 20;
 constexpr std::uint64_t kMaximumPayloadBytes  = 16ULL << 20;
+constexpr std::uint64_t kMaximumReportBytes   = 64ULL << 10;
 constexpr std::size_t kLayers            = 64;
 constexpr std::size_t kWriterCount       = 128;
 constexpr std::uint32_t kDirectionCount  = 5120;
 constexpr std::string_view kApprovedDirectionSha256 =
     "9de12cbe71f38baf2f6b4a21dfcb2b13bd6416ab4785214afce27c7543f05c1d";
+constexpr std::string_view kApprovedSidecarSha256 =
+    "1b536e5bbab61df1fc4bc3b9347818282327f47c887494e572d89740cc4d395e";
+constexpr std::string_view kApprovedReportSha256 =
+    "77e66b40b88ba4f0d74aa7350f6bb3d25cc366dcb4e750cd822c1bfde65e78cd";
 constexpr std::array<char, 8> kMagic{'N', 'I', 'N', 'F', 'R', 'P', '1', '\0'};
 constexpr std::array<std::string_view, 10> kRecordFields{
     "coefficient",          "direction_count",      "direction_offset",
@@ -43,7 +48,9 @@ constexpr std::array<std::string_view, 10> kRecordFields{
     "weight_payload_sha256",
 };
 
-using Digest = std::array<std::uint8_t, 32>;
+using Digest = projection_internal::Sha256Digest;
+using projection_internal::sha256;
+using projection_internal::sha256_file;
 
 struct Header {
     std::uint32_t version = 0;
@@ -82,111 +89,6 @@ std::uint64_t load_le64(const std::uint8_t* bytes) {
         value |= static_cast<std::uint64_t>(bytes[index]) << (8U * index);
     }
     return value;
-}
-
-std::uint32_t load_be32(const std::uint8_t* bytes) {
-    return (static_cast<std::uint32_t>(bytes[0]) << 24U) |
-           (static_cast<std::uint32_t>(bytes[1]) << 16U) |
-           (static_cast<std::uint32_t>(bytes[2]) << 8U) |
-           static_cast<std::uint32_t>(bytes[3]);
-}
-
-void store_be32(std::uint32_t value, std::uint8_t* bytes) {
-    bytes[0] = static_cast<std::uint8_t>(value >> 24U);
-    bytes[1] = static_cast<std::uint8_t>(value >> 16U);
-    bytes[2] = static_cast<std::uint8_t>(value >> 8U);
-    bytes[3] = static_cast<std::uint8_t>(value);
-}
-
-void sha256_block(std::array<std::uint32_t, 8>& state, const std::uint8_t* block) {
-    constexpr std::array<std::uint32_t, 64> round{
-        0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU, 0x59f111f1U,
-        0x923f82a4U, 0xab1c5ed5U, 0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
-        0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U, 0xe49b69c1U, 0xefbe4786U,
-        0x0fc19dc6U, 0x240ca1ccU, 0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
-        0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U,
-        0x06ca6351U, 0x14292967U, 0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
-        0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U, 0xa2bfe8a1U, 0xa81a664bU,
-        0xc24b8b70U, 0xc76c51a3U, 0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
-        0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU,
-        0x5b9cca4fU, 0x682e6ff3U, 0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
-        0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
-    };
-    std::array<std::uint32_t, 64> words{};
-    for (std::size_t index = 0; index < 16; ++index) {
-        words[index] = load_be32(block + 4 * index);
-    }
-    for (std::size_t index = 16; index < words.size(); ++index) {
-        const std::uint32_t s0 = std::rotr(words[index - 15], 7) ^
-                                 std::rotr(words[index - 15], 18) ^
-                                 (words[index - 15] >> 3U);
-        const std::uint32_t s1 = std::rotr(words[index - 2], 17) ^
-                                 std::rotr(words[index - 2], 19) ^
-                                 (words[index - 2] >> 10U);
-        words[index] = words[index - 16] + s0 + words[index - 7] + s1;
-    }
-    std::uint32_t a = state[0];
-    std::uint32_t b = state[1];
-    std::uint32_t c = state[2];
-    std::uint32_t d = state[3];
-    std::uint32_t e = state[4];
-    std::uint32_t f = state[5];
-    std::uint32_t g = state[6];
-    std::uint32_t h = state[7];
-    for (std::size_t index = 0; index < words.size(); ++index) {
-        const std::uint32_t sum1 = std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25);
-        const std::uint32_t choose = (e & f) ^ (~e & g);
-        const std::uint32_t t1 = h + sum1 + choose + round[index] + words[index];
-        const std::uint32_t sum0 = std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22);
-        const std::uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
-        const std::uint32_t t2 = sum0 + majority;
-        h = g;
-        g = f;
-        f = e;
-        e = d + t1;
-        d = c;
-        c = b;
-        b = a;
-        a = t1 + t2;
-    }
-    state[0] += a;
-    state[1] += b;
-    state[2] += c;
-    state[3] += d;
-    state[4] += e;
-    state[5] += f;
-    state[6] += g;
-    state[7] += h;
-}
-
-Digest sha256(std::span<const std::uint8_t> input) {
-    if (input.size() > std::numeric_limits<std::uint64_t>::max() / 8ULL) {
-        throw ProjectionError("projection manifest is too large to hash");
-    }
-    std::array<std::uint32_t, 8> state{0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U,
-                                       0xa54ff53aU, 0x510e527fU, 0x9b05688cU,
-                                       0x1f83d9abU, 0x5be0cd19U};
-    std::size_t offset = 0;
-    while (input.size() - offset >= 64) {
-        sha256_block(state, input.data() + offset);
-        offset += 64;
-    }
-    std::array<std::uint8_t, 128> tail{};
-    const std::size_t remaining = input.size() - offset;
-    std::copy_n(input.data() + offset, remaining, tail.data());
-    tail[remaining] = 0x80U;
-    const std::size_t tail_bytes = remaining < 56 ? 64 : 128;
-    const std::uint64_t bits = static_cast<std::uint64_t>(input.size()) * 8ULL;
-    for (std::size_t index = 0; index < 8; ++index) {
-        tail[tail_bytes - 1 - index] = static_cast<std::uint8_t>(bits >> (8U * index));
-    }
-    sha256_block(state, tail.data());
-    if (tail_bytes == 128) { sha256_block(state, tail.data() + 64); }
-    Digest result{};
-    for (std::size_t index = 0; index < state.size(); ++index) {
-        store_be32(state[index], result.data() + 4 * index);
-    }
-    return result;
 }
 
 std::uint8_t hex_nibble(char value) {
@@ -457,8 +359,8 @@ void read_exact(std::ifstream& input, void* destination, std::size_t bytes, cons
     }
 }
 
-void validate_finite_payload(const PinnedHostBuffer& payload,
-                             const std::vector<ParsedRecord>& records) {
+void validate_payload(const PinnedHostBuffer& payload,
+                      const std::vector<ParsedRecord>& records) {
     const auto* bytes = static_cast<const std::uint8_t*>(payload.data());
     for (const ParsedRecord& record : records) {
         for (const auto [offset, count] : {
@@ -472,7 +374,120 @@ void validate_finite_payload(const PinnedHostBuffer& payload,
                 }
             }
         }
+        const float* direction = reinterpret_cast<const float*>(bytes + record.direction_offset);
+        double squared_norm = 0.0;
+        for (std::uint32_t index = 0; index < record.direction_count; ++index) {
+            squared_norm += static_cast<double>(direction[index]) * direction[index];
+        }
+        const double norm = std::sqrt(squared_norm);
+        if (!std::isfinite(norm) || std::abs(norm - 1.0) > 1e-5) {
+            throw ProjectionError("projection direction must have unit length");
+        }
     }
+}
+
+void require_exact_fields(const Json& value, std::initializer_list<std::string_view> fields,
+                          std::string_view label) {
+    if (!value.is_object() || value.size() != fields.size()) {
+        throw ProjectionError(std::string(label) + " has missing or extra members");
+    }
+    std::set<std::string_view> remaining(fields.begin(), fields.end());
+    for (const auto& [name, unused] : value.items()) {
+        (void)unused;
+        if (!remaining.erase(name)) {
+            throw ProjectionError(std::string(label) + " has unknown member " + name);
+        }
+    }
+    if (!remaining.empty()) {
+        throw ProjectionError(std::string(label) + " has missing members");
+    }
+}
+
+void require_unsigned_value(const Json& value, std::string_view name, std::uint64_t expected) {
+    const Json& actual = member(value, name);
+    if (!actual.is_number_unsigned() || actual.get<std::uint64_t>() != expected) {
+        throw ProjectionError("projection conversion report member " + std::string(name) +
+                              " is not the approved value");
+    }
+}
+
+void require_string_value(const Json& value, std::string_view name, std::string_view expected) {
+    if (string_member(value, name) != expected) {
+        throw ProjectionError("projection conversion report member " + std::string(name) +
+                              " is not the approved value");
+    }
+}
+
+void validate_report_identity(const Json& report, std::string_view expected_model_sha256) {
+    require_exact_fields(report,
+                         {"artifact", "decoder_revision", "directions", "max_signature_error",
+                          "records", "schema_version", "sidecar", "sites",
+                          "unclaimed_records", "weight_formats"},
+                         "projection conversion report");
+    const Json& artifact = member(report, "artifact");
+    const Json& directions = member(report, "directions");
+    const Json& sidecar = member(report, "sidecar");
+    require_exact_fields(artifact, {"bytes", "path", "sha256"},
+                         "projection conversion report artifact");
+    require_exact_fields(directions, {"bytes", "path", "sha256"},
+                         "projection conversion report directions");
+    require_exact_fields(sidecar, {"bytes", "path", "sha256"},
+                         "projection conversion report sidecar");
+    (void)string_member(artifact, "path");
+    (void)string_member(directions, "path");
+    (void)string_member(sidecar, "path");
+    require_unsigned_value(artifact, "bytes", 21492695040ULL);
+    require_string_value(artifact, "sha256", expected_model_sha256);
+    require_unsigned_value(directions, "bytes", 2643584);
+    require_string_value(directions, "sha256", kApprovedDirectionSha256);
+    require_unsigned_value(sidecar, "bytes", 8695808);
+    require_string_value(sidecar, "sha256", kApprovedSidecarSha256);
+    require_unsigned_value(report, "schema_version", 1);
+    require_unsigned_value(report, "records", 128);
+    require_unsigned_value(report, "unclaimed_records", 0);
+    require_string_value(report, "decoder_revision",
+                         "a05746aa:tools.artifact.layouts.fp8-row/nvfp4");
+    const Json& max_error = member(report, "max_signature_error");
+    if (!max_error.is_number() || max_error.get<double>() != 0.0) {
+        throw ProjectionError("projection conversion report signature error is not zero");
+    }
+    const Json& sites = member(report, "sites");
+    require_exact_fields(sites, {"attention_output", "gdn_output", "mlp_down"},
+                         "projection conversion report sites");
+    require_unsigned_value(sites, "attention_output", 16);
+    require_unsigned_value(sites, "gdn_output", 48);
+    require_unsigned_value(sites, "mlp_down", 64);
+    const Json& formats = member(report, "weight_formats");
+    require_exact_fields(formats, {"fp8_row", "nvfp4_block"},
+                         "projection conversion report weight formats");
+    require_unsigned_value(formats, "fp8_row", 72);
+    require_unsigned_value(formats, "nvfp4_block", 56);
+}
+
+void authenticate_conversion_report(const std::filesystem::path& sidecar_path,
+                                    std::string_view expected_model_sha256) {
+    std::filesystem::path report_path = sidecar_path;
+    report_path.replace_extension(".conversion.json");
+    std::error_code file_error;
+    const std::uint64_t report_bytes = std::filesystem::file_size(report_path, file_error);
+    if (file_error || report_bytes == 0 || report_bytes > kMaximumReportBytes) {
+        throw ProjectionError("approved projection conversion report is missing or unbounded");
+    }
+    try {
+        if (sha256_file(report_path) != parse_digest(kApprovedReportSha256)) {
+            throw ProjectionError("projection conversion report is not the approved report");
+        }
+    } catch (const ProjectionError&) {
+        throw;
+    } catch (const std::exception& error) {
+        throw ProjectionError("could not authenticate projection conversion report: " +
+                              std::string(error.what()));
+    }
+    std::ifstream input(report_path, std::ios::binary);
+    if (!input) { throw ProjectionError("could not open approved projection conversion report"); }
+    std::string encoded(static_cast<std::size_t>(report_bytes), '\0');
+    read_exact(input, encoded.data(), encoded.size(), "projection conversion report");
+    validate_report_identity(parse_manifest(encoded), expected_model_sha256);
 }
 
 } // namespace
@@ -558,7 +573,18 @@ ResidualProjectionTable::load(const std::filesystem::path& path,
     input.seekg(static_cast<std::streamoff>(payload_offset), std::ios::beg);
     if (!input) { throw ProjectionError("could not seek to projection payload"); }
     read_exact(input, impl->host.data(), impl->host.size(), "projection payload");
-    validate_finite_payload(impl->host, impl->records);
+    validate_payload(impl->host, impl->records);
+    try {
+        if (sha256_file(path) != parse_digest(kApprovedSidecarSha256)) {
+            throw ProjectionError("projection file is not the approved sidecar");
+        }
+    } catch (const ProjectionError&) {
+        throw;
+    } catch (const std::exception& error) {
+        throw ProjectionError("could not authenticate complete projection sidecar: " +
+                              std::string(error.what()));
+    }
+    authenticate_conversion_report(path, expected_model_sha256);
     impl->device.copy_from_host(impl->host.data(), impl->host.size());
 
     ResidualProjectionTable table(std::move(impl));

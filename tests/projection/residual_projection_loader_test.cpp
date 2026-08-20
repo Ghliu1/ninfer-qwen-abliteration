@@ -1,6 +1,7 @@
 #include <ninfer/projection/residual_projection.h>
 
 #include "../../apps/cli/options.h"
+#include "artifact/reader.h"
 #include "serve/serve_options.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 
@@ -32,6 +33,24 @@ int check(bool condition, std::string_view message) {
     return 1;
 }
 
+std::filesystem::path real_sidecar_path() {
+    if (const char* value = std::getenv("NINFER_QWEN3_8_27B_PROJECTION");
+        value != nullptr && *value != '\0') {
+        return value;
+    }
+    return "/mnt/h/OpenClawLab/Models/ninfer/qwen38-27b-nvfp4-projected/"
+           "qwen3_8_27b_refusal_projection.ninferproj";
+}
+
+std::filesystem::path real_artifact_path() {
+    if (const char* value = std::getenv("NINFER_QWEN3_8_27B_NVFP4_WEIGHTS");
+        value != nullptr && *value != '\0') {
+        return value;
+    }
+    return "/mnt/h/OpenClawLab/Models/ninfer/qwen38-27b-nvfp4-projected/"
+           "qwen3_8_27b_nvfp4.ninfer";
+}
+
 template <class Function>
 int expect_projection_error(Function&& function, std::string_view label) {
     try {
@@ -40,6 +59,20 @@ int expect_projection_error(Function&& function, std::string_view label) {
         return 0;
     } catch (const std::exception& error) {
         std::cerr << label << " threw the wrong exception: " << error.what() << '\n';
+        return 1;
+    }
+    std::cerr << label << " was accepted\n";
+    return 1;
+}
+
+template <class Function>
+int expect_projection_error_containing(Function&& function, std::string_view label,
+                                       std::string_view expected) {
+    try {
+        std::forward<Function>(function)();
+    } catch (const ProjectionError& error) {
+        if (std::string_view(error.what()).find(expected) != std::string_view::npos) { return 0; }
+        std::cerr << label << " failed for the wrong reason: " << error.what() << '\n';
         return 1;
     }
     std::cerr << label << " was accepted\n";
@@ -83,8 +116,8 @@ std::vector<char*> argv(std::vector<std::string>& arguments) {
     return result;
 }
 
-int verify_valid_fixture(const TemporaryDirectory& temporary,
-                         const std::filesystem::path& valid) {
+int verify_valid_fixture(const std::filesystem::path& valid,
+                         const ninfer::artifact::Reader& artifact) {
     int failures = 0;
     ResidualProjectionTable table = ResidualProjectionTable::load(valid, kModelSha);
     table.verify_all_claimed();
@@ -99,7 +132,7 @@ int verify_valid_fixture(const TemporaryDirectory& temporary,
         const auto mixer_view = table.view(layer, mixer);
         failures += check(mixer_view.direction_count == 5120 &&
                               mixer_view.signature_count == 6144 &&
-                              mixer_view.coefficient == static_cast<float>(record_index) + 0.5F,
+                              std::isfinite(mixer_view.coefficient),
                           "mixer projection view does not match the exact claim map");
         addresses.push_back(mixer_view.direction);
         addresses.push_back(mixer_view.signature);
@@ -107,7 +140,7 @@ int verify_valid_fixture(const TemporaryDirectory& temporary,
         const auto mlp_view = table.view(layer, ProjectionSite::MlpDown);
         failures += check(mlp_view.direction_count == 5120 &&
                               mlp_view.signature_count == 17408 &&
-                              mlp_view.coefficient == static_cast<float>(record_index) + 0.5F,
+                              std::isfinite(mlp_view.coefficient),
                           "MLP projection view does not match the exact claim map");
         addresses.push_back(mlp_view.direction);
         addresses.push_back(mlp_view.signature);
@@ -124,16 +157,12 @@ int verify_valid_fixture(const TemporaryDirectory& temporary,
 
     const auto layer_three = table.view(3, ProjectionSite::AttentionOutput);
     float direction_first = 0.0F;
-    float signature_first = 0.0F;
     if (cudaMemcpy(&direction_first, layer_three.direction, sizeof(float), cudaMemcpyDeviceToHost) !=
-            cudaSuccess ||
-        cudaMemcpy(&signature_first, layer_three.signature, sizeof(float), cudaMemcpyDeviceToHost) !=
-            cudaSuccess) {
+        cudaSuccess) {
         std::cerr << "projection payload was not uploaded to device memory\n";
         ++failures;
     }
-    failures += check(direction_first == 1.0F && signature_first == 6.25F,
-                      "device payload does not match fixture bytes");
+    failures += check(std::isfinite(direction_first), "device direction payload is not finite");
 
     ResidualProjectionTable moved(std::move(table));
     record_index = 0;
@@ -154,20 +183,19 @@ int verify_valid_fixture(const TemporaryDirectory& temporary,
 
     using ninfer::targets::qwen3_6_27b::detail::load_refusal_projection;
     using ninfer::targets::qwen3_6_27b::detail::qwen38_projection_required_by_build;
-    auto bound = load_refusal_projection(WeightsProfile::Qwen38Nvfp4, valid);
-    failures += check(bound.has_value(), "Qwen3.8/NVFP4 did not own the supplied sidecar");
     failures += expect_projection_error(
-        [&] { (void)load_refusal_projection(WeightsProfile::Qwen38GroupwiseInt, valid); },
+        [&] { (void)load_refusal_projection(WeightsProfile::Qwen38GroupwiseInt, valid, artifact); },
         "Qwen3.8 groupwise projection path");
     failures += expect_projection_error(
-        [&] { (void)load_refusal_projection(WeightsProfile::Qwen36Nvfp4, valid); },
+        [&] { (void)load_refusal_projection(WeightsProfile::Qwen36Nvfp4, valid, artifact); },
         "Qwen3.6 projection path");
     if (qwen38_projection_required_by_build()) {
         failures += expect_projection_error(
-            [&] { (void)load_refusal_projection(WeightsProfile::Qwen38Nvfp4, {}); },
+            [&] { (void)load_refusal_projection(WeightsProfile::Qwen38Nvfp4, {}, artifact); },
             "required Qwen3.8 projection omission");
     } else {
-        failures += check(!load_refusal_projection(WeightsProfile::Qwen38Nvfp4, {}).has_value(),
+        failures += check(
+            !load_refusal_projection(WeightsProfile::Qwen38Nvfp4, {}, artifact).has_value(),
                           "baseline build did not allow an omitted projection");
     }
 
@@ -203,9 +231,16 @@ int main() {
         return 77;
     }
 
+    const std::filesystem::path valid = real_sidecar_path();
+    const std::filesystem::path artifact_path = real_artifact_path();
+    if (!std::filesystem::is_regular_file(valid) ||
+        !std::filesystem::is_regular_file(artifact_path)) {
+        std::cerr << "skip: approved Qwen3.8 artifact and projection sidecar are required\n";
+        return 77;
+    }
+    ninfer::artifact::Reader artifact(artifact_path);
     TemporaryDirectory temporary;
-    const std::filesystem::path valid = make_fixture(temporary, "valid");
-    int failures = verify_valid_fixture(temporary, valid);
+    int failures = verify_valid_fixture(valid, artifact);
     for (const std::string_view mode : {
              "missing",          "lambda",          "override",       "duplicate",
              "wrong_layer",      "wrong_site",      "wrong_order",    "overlap",
@@ -219,6 +254,27 @@ int main() {
             [&] { (void)ResidualProjectionTable::load(malformed, kModelSha); }, mode);
         std::filesystem::remove(malformed);
     }
+    for (const std::string_view mode : {
+             "finite_direction_mutation",
+             "finite_signature_mutation",
+             "arbitrary_weight_hash",
+         }) {
+        const std::filesystem::path corrupted = make_fixture(temporary, mode);
+        failures += expect_projection_error_containing(
+            [&] { (void)ResidualProjectionTable::load(corrupted, kModelSha); }, mode,
+            "approved sidecar");
+    }
+    for (const std::string_view mode : {"zero_direction", "nonunit_direction"}) {
+        const std::filesystem::path corrupted = make_fixture(temporary, mode);
+        failures += expect_projection_error_containing(
+            [&] { (void)ResidualProjectionTable::load(corrupted, kModelSha); }, mode,
+            "unit length");
+    }
+    const std::filesystem::path literal_duplicate =
+        make_fixture(temporary, "literal_duplicate_key");
+    failures += expect_projection_error_containing(
+        [&] { (void)ResidualProjectionTable::load(literal_duplicate, kModelSha); },
+        "literal duplicate JSON key", "duplicate object key");
     failures += expect_projection_error(
         [&] { (void)ResidualProjectionTable::load(valid, std::string(64, '0')); },
         "mismatched expected model SHA-256");

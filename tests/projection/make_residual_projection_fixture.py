@@ -58,6 +58,8 @@ def write_raw(path: Path, values: list[dict[str, object]], payload: bytes, mode:
     manifest = json.dumps(
         values, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
+    if mode == "literal_duplicate_key":
+        manifest = manifest.replace(b'"key":', b'"key":"duplicate","key":', 1)
     payload_offset = align_up(HEADER.size + len(manifest), PAYLOAD_ALIGNMENT)
     manifest_sha = hashlib.sha256(manifest).digest()
     artifact_sha = bytes.fromhex(APPROVED_ARTIFACT_SHA256)
@@ -131,8 +133,27 @@ def main() -> None:
         values[0]["direction_count"] = 5119
     elif mode == "wrong_format":
         values[0]["weight_format"] = "nvfp4_block"
+    elif mode == "arbitrary_weight_hash":
+        values[0]["weight_payload_sha256"] = "f" * 64
+    elif mode in {
+        "finite_direction_mutation",
+        "finite_signature_mutation",
+        "zero_direction",
+        "nonunit_direction",
+    }:
+        payload = bytearray(payload)
+        if mode == "finite_direction_mutation":
+            struct.pack_into("<f", payload, records[0].direction_offset, -1.0)
+        elif mode == "finite_signature_mutation":
+            struct.pack_into("<f", payload, records[0].signature_offset, 1.25)
+        elif mode == "zero_direction":
+            struct.pack_into("<f", payload, records[0].direction_offset, 0.0)
+        else:
+            struct.pack_into("<f", payload, records[0].direction_offset, 0.5)
+        payload = bytes(payload)
     elif mode not in {
         "valid",
+        "literal_duplicate_key",
         "wrong_artifact_hash",
         "wrong_direction_hash",
         "bad_manifest_hash",

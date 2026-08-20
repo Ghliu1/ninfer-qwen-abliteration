@@ -136,7 +136,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
 [[nodiscard]] bool qwen38_projection_required_by_build() noexcept;
 [[nodiscard]] std::optional<ResidualProjectionTable>
-load_refusal_projection(WeightsProfile weights_profile, const std::filesystem::path& path);
+load_refusal_projection(WeightsProfile weights_profile, const std::filesystem::path& path,
+                        const artifact::Reader& artifact);
 
 struct DensePostMixerPayload {
     Weight gate_up;

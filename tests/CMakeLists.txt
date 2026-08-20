@@ -67,6 +67,17 @@ set_tests_properties(residual_projection_loader_test PROPERTIES SKIP_RETURN_CODE
 target_include_directories(residual_projection_loader_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+ninfer_add_test(projection_integrity_test
+  SOURCES projection/projection_integrity_test.cpp
+  LIBRARIES ninfer_projection)
+target_include_directories(projection_integrity_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+ninfer_add_test(qwen3_8_27b_load_test
+  SOURCES projection/qwen3_8_projection_load_test.cpp
+  LIBRARIES ninfer_engine CUDA::cudart)
+set_tests_properties(qwen3_8_27b_load_test PROPERTIES SKIP_RETURN_CODE 77)
+target_include_directories(qwen3_8_27b_load_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 ninfer_add_test(ninfer_media_decode_test
   SOURCES test_media_decode.cpp
   LIBRARIES ninfer_media_decode)

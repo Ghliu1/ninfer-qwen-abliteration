@@ -1,5 +1,7 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 
+#include "projection/sha256.h"
+
 #include "artifact/typed_binding.h"
 
 #include <algorithm>
@@ -8,8 +10,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -24,6 +28,34 @@ constexpr std::string_view kApprovedQwen38ArtifactSha256 =
     "bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32";
 
 using artifact::NumericFormat;
+
+projection_internal::Sha256Digest hash_bound_artifact(const artifact::Reader& artifact) {
+    constexpr std::size_t kChunkBytes = 8ULL << 20;
+    struct FreeAligned {
+        void operator()(void* pointer) const noexcept { std::free(pointer); }
+    };
+    std::unique_ptr<void, FreeAligned> storage(
+        std::aligned_alloc(artifact::Reader::direct_io_alignment, kChunkBytes));
+    if (!storage) { throw std::bad_alloc(); }
+    auto* buffer = static_cast<std::byte*>(storage.get());
+    projection_internal::Sha256Stream hash;
+    std::uint64_t offset = 0;
+    while (offset < artifact.file_bytes()) {
+        const std::size_t bytes_read = artifact.read_direct(offset, {buffer, kChunkBytes});
+        if (bytes_read == 0 || bytes_read > artifact.file_bytes() - offset) {
+            throw artifact::ArtifactError("could not hash the complete bound artifact");
+        }
+        const auto bytes = std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(buffer), bytes_read);
+        hash.update(bytes);
+        offset += bytes_read;
+        if (offset < artifact.file_bytes() &&
+            offset % artifact::Reader::direct_io_alignment != 0) {
+            throw artifact::ArtifactError("bound artifact hash read ended before aligned EOF");
+        }
+    }
+    return hash.finish();
+}
 
 bool is_full_layer(std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; }
 
@@ -422,7 +454,8 @@ bool qwen38_projection_required_by_build() noexcept {
 }
 
 std::optional<ResidualProjectionTable>
-load_refusal_projection(WeightsProfile weights_profile, const std::filesystem::path& path) {
+load_refusal_projection(WeightsProfile weights_profile, const std::filesystem::path& path,
+                        const artifact::Reader& artifact) {
     const bool is_qwen38_nvfp4 = weights_profile == WeightsProfile::Qwen38Nvfp4;
     if (!path.empty() && !is_qwen38_nvfp4) {
         throw ProjectionError(
@@ -434,6 +467,17 @@ load_refusal_projection(WeightsProfile weights_profile, const std::filesystem::p
                 "qwen3.8-27b/nvfp4 requires --refusal-projection in this build");
         }
         return std::nullopt;
+    }
+    try {
+        const auto digest = hash_bound_artifact(artifact);
+        if (projection_internal::sha256_hex(digest) != kApprovedQwen38ArtifactSha256) {
+            throw ProjectionError("actual Qwen3.8 artifact SHA-256 is not approved");
+        }
+    } catch (const ProjectionError&) {
+        throw;
+    } catch (const std::exception& error) {
+        throw ProjectionError("could not authenticate actual Qwen3.8 artifact SHA-256: " +
+                              std::string(error.what()));
     }
     return ResidualProjectionTable::load(path, kApprovedQwen38ArtifactSha256);
 }

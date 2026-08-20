@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
+#include <ninfer/projection/residual_projection.h>
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/runtime.h>
 
@@ -50,6 +51,8 @@ public:
     LoadPlan& operator=(const LoadPlan&) = delete;
 
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
+    [[nodiscard]] ResidualProjectionView refusal_projection(std::uint32_t layer,
+                                                            ProjectionSite site) const;
 
 private:
     class Impl;

@@ -46,7 +46,8 @@ target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 
 # Immutable schema-1 residual-projection metadata and its one-time device upload.
 add_library(ninfer_projection STATIC
-  projection/residual_projection.cpp)
+  projection/residual_projection.cpp
+  projection/sha256.cpp)
 ninfer_internal_includes(ninfer_projection)
 target_link_libraries(ninfer_projection PUBLIC ninfer_core)
 

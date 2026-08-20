@@ -34,6 +34,15 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->plan.materialization;
 }
 
+ResidualProjectionView LoadPlan::refusal_projection(std::uint32_t layer,
+                                                    ProjectionSite site) const {
+    if (impl_ == nullptr) { throw std::logic_error("target load plan is empty"); }
+    if (!impl_->refusal_projection.has_value()) {
+        throw ProjectionError("target load plan does not own a refusal projection");
+    }
+    return impl_->refusal_projection->view(layer, site);
+}
+
 LoadedModel::LoadedModel(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 LoadedModel::~LoadedModel() = default;
@@ -105,7 +114,8 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     auto refusal_projection =
-        detail::load_refusal_projection(weights_profile, options.refusal_projection_path);
+        detail::load_refusal_projection(weights_profile, options.refusal_projection_path,
+                                        binder.reader());
     auto artifact_plan =
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options));
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
