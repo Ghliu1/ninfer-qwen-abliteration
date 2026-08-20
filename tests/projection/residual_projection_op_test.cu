@@ -24,8 +24,11 @@ using namespace ninfer;
 using namespace ninfer::test;
 
 constexpr std::int32_t kOutputRows = 5120;
+constexpr std::int32_t kSparseWeightColumn = 0;
 constexpr std::array<std::int32_t, 6> kTokenCases{1, 16, 22, 25, 256, 1024};
 constexpr std::int32_t kNvfp4SmallTToken = 2;
+constexpr std::size_t kMinimumOrderingSentinelsPerToken = 16;
+constexpr float kOrderingSignatureValue = 32.0F;
 constexpr float kMaxAbsoluteError = 0.03125F;
 constexpr double kMinimumCosine = 0.9999;
 
@@ -134,9 +137,20 @@ std::vector<float> make_signature(std::int32_t input_rows) {
     return signature;
 }
 
+std::vector<float> make_ordering_signature(std::int32_t input_rows) {
+    std::vector<float> signature(input_rows, 0.0F);
+    signature.back() = kOrderingSignatureValue;
+    return signature;
+}
+
 std::vector<float> make_direction() {
     const float value = 1.0F / std::sqrt(static_cast<float>(kOutputRows));
     return std::vector<float>(kOutputRows, value);
+}
+
+float sparse_weight_value(std::int32_t row) {
+    constexpr std::array<float, 6> kValues{0.5F, 1.0F, 1.5F, -0.5F, -1.0F, -1.5F};
+    return kValues[static_cast<std::size_t>(row) % kValues.size()];
 }
 
 float route_score(const RouteFamily& family, std::span<const std::uint16_t> activation,
@@ -190,28 +204,117 @@ float route_score(const RouteFamily& family, std::span<const std::uint16_t> acti
     return score;
 }
 
-quantized_weight::PackedWeight make_patterned_projection_weight(const RouteFamily& family) {
+float nvfp4_ordering_score(const RouteFamily& family,
+                           std::span<const std::uint16_t> activation, std::int32_t token) {
+    constexpr std::int32_t kGroup = 16;
+    constexpr float kInputScaleDivisor = 3.5F;
+    const auto* x = activation.data() + static_cast<std::size_t>(token) * family.input_rows;
+    const std::int32_t group = family.input_rows - kGroup;
+    float maximum = 0.0F;
+    for (std::int32_t lane = 0; lane < kGroup; ++lane) {
+        maximum = std::max(maximum, std::abs(bf16_to_f32(x[group + lane])));
+    }
+    const std::uint8_t scale_code = encode_e4m3fn(kInputScaleDivisor * maximum / 6.0F);
+    const float scale = static_cast<float>(decode_e4m3fn(scale_code));
+    if (scale == 0.0F) { return 0.0F; }
+    const float output_scale = scale / kInputScaleDivisor;
+    const std::uint8_t code = encode_e2m1(
+        bf16_to_f32(x[family.input_rows - 1]) * kInputScaleDivisor / scale);
+    const float decoded = static_cast<float>(decode_e2m1(code));
+    return (kOrderingSignatureValue * decoded) * output_scale;
+}
+
+struct SparseActivationProfile {
+    float logical_value;
+    float emitted_code;
+    float emitted_scale;
+    float output_scale;
+};
+
+SparseActivationProfile route_activation_at_sparse_column(
+    const RouteFamily& family, std::span<const std::uint16_t> activation, std::int32_t token,
+    std::int32_t tokens) {
+    const auto* x = activation.data() + static_cast<std::size_t>(token) * family.input_rows;
+    if (tokens < family.first_quantized_token) {
+        const float value = bf16_to_f32(x[kSparseWeightColumn]);
+        return SparseActivationProfile{value, value, 1.0F, 1.0F};
+    }
+
+    if (family.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        float maximum = 0.0F;
+        for (std::int32_t column = 0; column < family.input_rows; ++column) {
+            maximum = std::max(maximum, std::abs(bf16_to_f32(x[column])));
+        }
+        if (maximum == 0.0F) { return SparseActivationProfile{}; }
+        const float scale = maximum / 448.0F;
+        const float code = static_cast<float>(decode_e4m3fn(
+            encode_e4m3fn(bf16_to_f32(x[kSparseWeightColumn]) / scale)));
+        return SparseActivationProfile{code * scale, code, scale, 1.0F};
+    }
+
+    constexpr float kInputScaleDivisor = 3.5F;
+    float maximum = 0.0F;
+    for (std::int32_t lane = 0; lane < 16; ++lane) {
+        maximum = std::max(maximum, std::abs(bf16_to_f32(x[lane])));
+    }
+    const std::uint8_t scale_code = encode_e4m3fn(kInputScaleDivisor * maximum / 6.0F);
+    const float scale = static_cast<float>(decode_e4m3fn(scale_code));
+    if (scale == 0.0F) { return SparseActivationProfile{}; }
+    const std::uint8_t code =
+        encode_e2m1(bf16_to_f32(x[kSparseWeightColumn]) * kInputScaleDivisor / scale);
+    const float decoded = static_cast<float>(decode_e2m1(code));
+    return SparseActivationProfile{decoded * scale / kInputScaleDivisor, decoded, scale,
+                                   1.0F / kInputScaleDivisor};
+}
+
+quantized_weight::PackedWeight make_sparse_projection_weight(const RouteFamily& family) {
     quantized_weight::PatternedWeightOptions options;
     if (family.qtype == QType::NVFP4) {
-        options.weight_scale_divisor = 8.0F;
+        options.weight_scale_divisor = 1.0F;
         options.input_scale_divisor = 3.5F;
     }
     auto weight = quantized_weight::make_patterned_weight(
         family.qtype, kOutputRows, family.input_rows, family.seed, options);
+    std::fill_n(weight.payload.begin(), static_cast<std::size_t>(weight.code_plane_bytes),
+                static_cast<std::uint8_t>(0));
+    std::fill_n(weight.payload.begin() + static_cast<std::size_t>(weight.scale_plane_offset),
+                static_cast<std::size_t>(weight.scale_plane_bytes), static_cast<std::uint8_t>(0));
     if (family.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        const std::uint16_t scale = f32_to_bf16(1.0F / 4096.0F);
+        constexpr std::array<std::uint8_t, 6> kCodes{0x30U, 0x38U, 0x3cU,
+                                                      0xb0U, 0xb8U, 0xbcU};
+        const std::uint16_t scale = f32_to_bf16(1.0F);
         for (std::int32_t row = 0; row < kOutputRows; ++row) {
+            weight.payload[static_cast<std::size_t>(row) * family.input_rows +
+                           kSparseWeightColumn] =
+                kCodes[static_cast<std::size_t>(row) % kCodes.size()];
             const std::size_t offset =
                 weight.scale_plane_offset + static_cast<std::size_t>(row) * sizeof(scale);
             weight.payload[offset] = static_cast<std::uint8_t>(scale & 0xffU);
             weight.payload[offset + 1] = static_cast<std::uint8_t>(scale >> 8);
+        }
+    } else {
+        constexpr std::array<std::uint8_t, 6> kCodes{0x01U, 0x02U, 0x03U,
+                                                      0x09U, 0x0aU, 0x0bU};
+        constexpr std::uint8_t kUnitE4m3 = 0x38U;
+        const std::int32_t k_tiles = family.input_rows / 64;
+        for (std::int32_t row = 0; row < kOutputRows; ++row) {
+            weight.payload[static_cast<std::size_t>(row) * family.input_rows / 2] =
+                kCodes[static_cast<std::size_t>(row) % kCodes.size()];
+            const std::int32_t row_tile = row / 128;
+            const std::int32_t row_inner = row % 128;
+            const std::size_t scale_offset =
+                weight.scale_plane_offset +
+                static_cast<std::size_t>(row_tile * k_tiles) * 512U +
+                static_cast<std::size_t>(row_inner % 32) * 16U +
+                static_cast<std::size_t>(row_inner / 32) * 4U;
+            weight.payload[scale_offset] = kUnitE4m3;
         }
     }
     return weight;
 }
 
 quantized_weight::PackedWeight make_zero_weight(const RouteFamily& family) {
-    auto weight = make_patterned_projection_weight(family);
+    auto weight = make_sparse_projection_weight(family);
     std::fill_n(weight.payload.begin(), static_cast<std::size_t>(weight.code_plane_bytes),
                 static_cast<std::uint8_t>(0));
     return weight;
@@ -222,18 +325,24 @@ int verify_projection(const RouteFamily& family, std::int32_t tokens,
                       std::span<const std::uint16_t> initial_residual,
                       std::span<const float> signature, std::span<const float> direction,
                       const Weight& weight, GuardedDeviceBuffer& device_activation,
-                      const ResidualProjectionView* projection) {
+                      const ResidualProjectionView* projection,
+                      const ResidualProjectionView* ordering_projection) {
     const std::size_t words = static_cast<std::size_t>(kOutputRows) * tokens;
+    const bool use_ordering_projection =
+        family.qtype == QType::NVFP4 && tokens >= family.first_quantized_token;
     GuardedDeviceBuffer projected(words * sizeof(std::uint16_t));
+    GuardedDeviceBuffer ordering_projected(words * sizeof(std::uint16_t));
     GuardedDeviceBuffer legacy(words * sizeof(std::uint16_t));
     GuardedDeviceBuffer null_projection(words * sizeof(std::uint16_t));
     GuardedDeviceBuffer zero_coefficient(words * sizeof(std::uint16_t));
     projected.copy_from_host(initial_residual.data(), projected.bytes());
+    ordering_projected.copy_from_host(initial_residual.data(), ordering_projected.bytes());
     legacy.copy_from_host(initial_residual.data(), legacy.bytes());
     null_projection.copy_from_host(initial_residual.data(), null_projection.bytes());
     zero_coefficient.copy_from_host(initial_residual.data(), zero_coefficient.bytes());
     Tensor x(device_activation.data(), DType::BF16, {family.input_rows, tokens});
     Tensor out(projected.data(), DType::BF16, {kOutputRows, tokens});
+    Tensor ordering_out(ordering_projected.data(), DType::BF16, {kOutputRows, tokens});
     Tensor legacy_out(legacy.data(), DType::BF16, {kOutputRows, tokens});
     Tensor null_out(null_projection.data(), DType::BF16, {kOutputRows, tokens});
     Tensor zero_out(zero_coefficient.data(), DType::BF16, {kOutputRows, tokens});
@@ -243,6 +352,7 @@ int verify_projection(const RouteFamily& family, std::int32_t tokens,
     const std::size_t projected_capacity =
         base_capacity + sizeof(float) * static_cast<std::size_t>(tokens);
     WorkspaceArena workspace(projected_capacity);
+    WorkspaceArena ordering_workspace(projected_capacity);
     WorkspaceArena legacy_workspace(std::max<std::size_t>(base_capacity, 256));
     WorkspaceArena null_workspace(std::max<std::size_t>(base_capacity, 256));
     WorkspaceArena zero_workspace(projected_capacity);
@@ -250,6 +360,10 @@ int verify_projection(const RouteFamily& family, std::int32_t tokens,
     zero_projection.coefficient = 0.0F;
 
     ops::linear_add(x, weight, out, family.policy, projection, workspace, nullptr);
+    if (use_ordering_projection) {
+        ops::linear_add(x, weight, ordering_out, family.policy, ordering_projection,
+                        ordering_workspace, nullptr);
+    }
     ops::linear_add(x, weight, legacy_out, family.policy, legacy_workspace, nullptr);
     ops::linear_add(x, weight, null_out, family.policy, nullptr, null_workspace, nullptr);
     ops::linear_add(x, weight, zero_out, family.policy, &zero_projection, zero_workspace, nullptr);
@@ -257,11 +371,20 @@ int verify_projection(const RouteFamily& family, std::int32_t tokens,
 
     const std::string label = std::string(family.label) + " T=" + std::to_string(tokens);
     int failures = projected.verify_guards(label);
+    if (use_ordering_projection) {
+        failures += ordering_projected.verify_guards(label + " ordering projection");
+    }
     failures += legacy.verify_guards(label + " legacy");
     failures += null_projection.verify_guards(label + " null");
     failures += zero_coefficient.verify_guards(label + " zero coefficient");
     if (workspace.used() != 0 || workspace.peak_used() != projected_capacity) {
         std::cerr << label << ": projected workspace was not base + exactly 4*T bytes\n";
+        ++failures;
+    }
+    if (use_ordering_projection &&
+        (ordering_workspace.used() != 0 ||
+         ordering_workspace.peak_used() != projected_capacity)) {
+        std::cerr << label << ": ordering projection workspace was not base + exactly 4*T bytes\n";
         ++failures;
     }
     if (zero_workspace.used() != 0 || zero_workspace.peak_used() != projected_capacity) {
@@ -270,15 +393,20 @@ int verify_projection(const RouteFamily& family, std::int32_t tokens,
     }
 
     std::vector<std::uint16_t> actual(words);
+    std::vector<std::uint16_t> ordering_actual;
     std::vector<std::uint16_t> legacy_bits(words);
     std::vector<std::uint16_t> null_bits(words);
     std::vector<std::uint16_t> zero_bits(words);
     projected.copy_to_host(actual.data(), projected.bytes());
+    if (use_ordering_projection) {
+        ordering_actual.resize(words);
+        ordering_projected.copy_to_host(ordering_actual.data(), ordering_projected.bytes());
+    }
     legacy.copy_to_host(legacy_bits.data(), legacy.bytes());
     null_projection.copy_to_host(null_bits.data(), null_projection.bytes());
     zero_coefficient.copy_to_host(zero_bits.data(), zero_coefficient.bytes());
     if (std::equal(legacy_bits.begin(), legacy_bits.end(), initial_residual.begin())) {
-        std::cerr << label << ": patterned fixture produced no observable matmul\n";
+        std::cerr << label << ": sparse fixture produced no observable matmul\n";
         ++failures;
     }
     if (legacy_bits != null_bits || null_workspace.peak_used() != base_capacity) {
@@ -308,16 +436,91 @@ int verify_projection(const RouteFamily& family, std::int32_t tokens,
     std::vector<double> expected_values;
     actual_values.reserve(words);
     expected_values.reserve(words);
+    std::size_t discriminating_elements = 0;
+    std::size_t ordering_mismatches = 0;
+    std::size_t first_ordering_mismatch = words;
+    std::uint16_t first_ordering_actual_bits = 0;
+    std::uint16_t first_ordering_expected_bits = 0;
+    std::uint16_t first_post_store_bits = 0;
+    float first_profiled_matmul = 0.0F;
+    float first_ordering_score = 0.0F;
+    float first_profiled_correction = 0.0F;
+    float first_residual = 0.0F;
     for (std::int32_t token = 0; token < tokens; ++token) {
-        const float score = route_score(family, activation, signature, token, tokens);
+        const float logical_score = route_score(family, activation, signature, token, tokens);
+        const float ordering_score = use_ordering_projection
+                                         ? nvfp4_ordering_score(family, activation, token)
+                                         : logical_score;
+        const ResidualProjectionView* sentinel_projection =
+            use_ordering_projection ? ordering_projection : projection;
+        const auto& sentinel_actual = use_ordering_projection ? ordering_actual : actual;
+        const SparseActivationProfile sparse_activation =
+            route_activation_at_sparse_column(family, activation, token, tokens);
         for (std::int32_t row = 0; row < kOutputRows; ++row) {
             const std::size_t index = static_cast<std::size_t>(token) * kOutputRows + row;
-            const float expected = bf16_to_f32(f32_to_bf16(
-                bf16_to_f32(legacy_bits[index]) -
-                projection->coefficient * direction[row] * score));
+            const float weight_value = sparse_weight_value(row);
+            const float logical_matmul = weight_value * sparse_activation.logical_value;
+            const float emitted_product = weight_value * sparse_activation.emitted_code;
+            const float profiled_matmul =
+                (emitted_product * sparse_activation.emitted_scale) *
+                sparse_activation.output_scale;
+            const float profiled_correction =
+                sentinel_projection->coefficient * direction[row] * ordering_score;
+            const float logical_correction =
+                projection->coefficient * direction[row] * logical_score;
+            const float residual = bf16_to_f32(initial_residual[index]);
+            const std::uint16_t expected_bits =
+                f32_to_bf16((profiled_matmul - profiled_correction) + residual);
+            const std::uint16_t post_store_bits = f32_to_bf16(
+                bf16_to_f32(f32_to_bf16(profiled_matmul + residual)) - profiled_correction);
+            if (expected_bits != post_store_bits) {
+                ++discriminating_elements;
+                if (sentinel_actual[index] != expected_bits) {
+                    if (first_ordering_mismatch == words) {
+                        first_ordering_mismatch = index;
+                        first_ordering_actual_bits = sentinel_actual[index];
+                        first_ordering_expected_bits = expected_bits;
+                        first_post_store_bits = post_store_bits;
+                        first_profiled_matmul = profiled_matmul;
+                        first_ordering_score = ordering_score;
+                        first_profiled_correction = profiled_correction;
+                        first_residual = residual;
+                    }
+                    ++ordering_mismatches;
+                }
+            }
             actual_values.push_back(bf16_to_f32(actual[index]));
-            expected_values.push_back(expected);
+            expected_values.push_back(
+                bf16_to_f32(f32_to_bf16((logical_matmul - logical_correction) + residual)));
         }
+    }
+    const std::size_t minimum_discriminators =
+        static_cast<std::size_t>(tokens) * kMinimumOrderingSentinelsPerToken;
+    if (discriminating_elements < minimum_discriminators) {
+        std::cerr << label << ": fixture has only " << discriminating_elements
+                  << " pre-store ordering sentinels; required at least " << minimum_discriminators
+                  << '\n';
+        ++failures;
+    }
+    if (ordering_mismatches != 0) {
+        const std::size_t token = first_ordering_mismatch / kOutputRows;
+        const std::size_t row = first_ordering_mismatch - token * kOutputRows;
+        std::cerr << label << ": " << ordering_mismatches << '/' << discriminating_elements
+                  << " ordering sentinels from "
+                  << (use_ordering_projection ? "the dedicated NVFP4 ordering projection"
+                                              : "the main projection")
+                  << " missed the analytical pre-store BF16 result; first token=" << token
+                  << " row=" << row << " actual_bits=" << first_ordering_actual_bits
+                  << " expected_bits=" << first_ordering_expected_bits
+                  << " wrong_post_store_bits=" << first_post_store_bits
+                  << " actual=" << bf16_to_f32(first_ordering_actual_bits)
+                  << " expected=" << bf16_to_f32(first_ordering_expected_bits)
+                  << " wrong_post_store=" << bf16_to_f32(first_post_store_bits)
+                  << " profiled_matmul=" << first_profiled_matmul
+                  << " score=" << first_ordering_score
+                  << " correction=" << first_profiled_correction
+                  << " residual=" << first_residual << '\n';
+        ++failures;
     }
 
     double dot = 0.0;
@@ -342,19 +545,23 @@ int verify_projection(const RouteFamily& family, std::int32_t tokens,
 int run_numerical_routes() {
     int failures = 0;
     for (const RouteFamily& family : kRouteFamilies) {
-        auto host_weight = make_patterned_projection_weight(family);
+        auto host_weight = make_sparse_projection_weight(family);
         GuardedDeviceBuffer device_weight(host_weight.payload.size());
         device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
         const Weight weight = host_weight.device_weight(device_weight.data());
         const auto activation = make_activation(family.input_rows, kTokenCases.back(), family.seed);
         const auto residual = make_residual(kTokenCases.back(), family.seed + 1U);
         const auto signature = make_signature(family.input_rows);
+        const auto ordering_signature = make_ordering_signature(family.input_rows);
         const auto direction = make_direction();
         GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
         GuardedDeviceBuffer device_signature(signature.size() * sizeof(float));
+        GuardedDeviceBuffer device_ordering_signature(ordering_signature.size() * sizeof(float));
         GuardedDeviceBuffer device_direction(direction.size() * sizeof(float));
         device_activation.copy_from_host(activation.data(), device_activation.bytes());
         device_signature.copy_from_host(signature.data(), device_signature.bytes());
+        device_ordering_signature.copy_from_host(ordering_signature.data(),
+                                                 device_ordering_signature.bytes());
         device_direction.copy_from_host(direction.data(), device_direction.bytes());
         const ResidualProjectionView projection{
             static_cast<const float*>(device_direction.data()),
@@ -363,6 +570,13 @@ int run_numerical_routes() {
             static_cast<std::uint32_t>(direction.size()),
             static_cast<std::uint32_t>(signature.size()),
         };
+        const ResidualProjectionView ordering_projection{
+            static_cast<const float*>(device_direction.data()),
+            static_cast<const float*>(device_ordering_signature.data()),
+            1.0F,
+            static_cast<std::uint32_t>(direction.size()),
+            static_cast<std::uint32_t>(ordering_signature.size()),
+        };
         for (const std::int32_t tokens : kTokenCases) {
             failures += verify_projection(
                 family, tokens,
@@ -370,7 +584,8 @@ int run_numerical_routes() {
                                                static_cast<std::size_t>(family.input_rows) * tokens),
                 std::span<const std::uint16_t>(residual.data(),
                                                static_cast<std::size_t>(kOutputRows) * tokens),
-                signature, direction, weight, device_activation, &projection);
+                signature, direction, weight, device_activation, &projection,
+                &ordering_projection);
         }
         if (family.qtype == QType::NVFP4) {
             failures += verify_projection(
@@ -380,7 +595,8 @@ int run_numerical_routes() {
                     static_cast<std::size_t>(family.input_rows) * kNvfp4SmallTToken),
                 std::span<const std::uint16_t>(
                     residual.data(), static_cast<std::size_t>(kOutputRows) * kNvfp4SmallTToken),
-                signature, direction, weight, device_activation, &projection);
+                signature, direction, weight, device_activation, &projection,
+                &ordering_projection);
         }
     }
     return failures;
