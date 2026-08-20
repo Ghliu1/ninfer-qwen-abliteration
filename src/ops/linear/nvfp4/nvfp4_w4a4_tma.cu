@@ -145,7 +145,10 @@ void launch_linear_add(const std::uint8_t* activation_codes, const std::uint8_t*
                        __nv_bfloat16* residual, std::int32_t tokens, float alpha,
                        const ResidualProjectionView* projection, const float* scores,
                        cudaStream_t stream) {
-    if (projection == nullptr) {
+    // Preserve the exact legacy epilogue instantiation when projection is the identity. Keeping
+    // the intervening correction expression active can inhibit contraction of accumulator * alpha
+    // with the residual add, even when its runtime coefficient is zero.
+    if (projection == nullptr || projection->coefficient == 0.0F) {
         launch_tma<Geometry, TmaM256N128>(
             activation_codes, activation_scales, weight_codes, weight_scales, tokens, alpha,
             Nvfp4AddResidualEpilogue{residual, Geometry::kOutputRows},

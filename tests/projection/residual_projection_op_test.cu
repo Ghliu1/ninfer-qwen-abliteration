@@ -25,6 +25,7 @@ using namespace ninfer::test;
 
 constexpr std::int32_t kOutputRows = 5120;
 constexpr std::array<std::int32_t, 6> kTokenCases{1, 16, 22, 25, 256, 1024};
+constexpr std::int32_t kNvfp4SmallTToken = 2;
 constexpr float kMaxAbsoluteError = 0.03125F;
 constexpr double kMinimumCosine = 0.9999;
 
@@ -189,14 +190,28 @@ float route_score(const RouteFamily& family, std::span<const std::uint16_t> acti
     return score;
 }
 
-quantized_weight::PackedWeight make_zero_weight(const RouteFamily& family) {
+quantized_weight::PackedWeight make_patterned_projection_weight(const RouteFamily& family) {
     quantized_weight::PatternedWeightOptions options;
     if (family.qtype == QType::NVFP4) {
-        options.weight_scale_divisor = 0.125F;
+        options.weight_scale_divisor = 8.0F;
         options.input_scale_divisor = 3.5F;
     }
     auto weight = quantized_weight::make_patterned_weight(
         family.qtype, kOutputRows, family.input_rows, family.seed, options);
+    if (family.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        const std::uint16_t scale = f32_to_bf16(1.0F / 4096.0F);
+        for (std::int32_t row = 0; row < kOutputRows; ++row) {
+            const std::size_t offset =
+                weight.scale_plane_offset + static_cast<std::size_t>(row) * sizeof(scale);
+            weight.payload[offset] = static_cast<std::uint8_t>(scale & 0xffU);
+            weight.payload[offset + 1] = static_cast<std::uint8_t>(scale >> 8);
+        }
+    }
+    return weight;
+}
+
+quantized_weight::PackedWeight make_zero_weight(const RouteFamily& family) {
+    auto weight = make_patterned_projection_weight(family);
     std::fill_n(weight.payload.begin(), static_cast<std::size_t>(weight.code_plane_bytes),
                 static_cast<std::uint8_t>(0));
     return weight;
@@ -210,30 +225,85 @@ int verify_projection(const RouteFamily& family, std::int32_t tokens,
                       const ResidualProjectionView* projection) {
     const std::size_t words = static_cast<std::size_t>(kOutputRows) * tokens;
     GuardedDeviceBuffer projected(words * sizeof(std::uint16_t));
+    GuardedDeviceBuffer legacy(words * sizeof(std::uint16_t));
+    GuardedDeviceBuffer null_projection(words * sizeof(std::uint16_t));
+    GuardedDeviceBuffer zero_coefficient(words * sizeof(std::uint16_t));
     projected.copy_from_host(initial_residual.data(), projected.bytes());
+    legacy.copy_from_host(initial_residual.data(), legacy.bytes());
+    null_projection.copy_from_host(initial_residual.data(), null_projection.bytes());
+    zero_coefficient.copy_from_host(initial_residual.data(), zero_coefficient.bytes());
     Tensor x(device_activation.data(), DType::BF16, {family.input_rows, tokens});
     Tensor out(projected.data(), DType::BF16, {kOutputRows, tokens});
+    Tensor legacy_out(legacy.data(), DType::BF16, {kOutputRows, tokens});
+    Tensor null_out(null_projection.data(), DType::BF16, {kOutputRows, tokens});
+    Tensor zero_out(zero_coefficient.data(), DType::BF16, {kOutputRows, tokens});
 
     const std::size_t base_capacity = ops::linear_add_workspace_capacity_bytes(
         family.qtype, kOutputRows, family.input_rows, family.policy, tokens, tokens);
     const std::size_t projected_capacity =
         base_capacity + sizeof(float) * static_cast<std::size_t>(tokens);
     WorkspaceArena workspace(projected_capacity);
+    WorkspaceArena legacy_workspace(std::max<std::size_t>(base_capacity, 256));
+    WorkspaceArena null_workspace(std::max<std::size_t>(base_capacity, 256));
+    WorkspaceArena zero_workspace(projected_capacity);
+    ResidualProjectionView zero_projection = *projection;
+    zero_projection.coefficient = 0.0F;
 
-    // RED: Task 5 adds this projection-bearing overload. Its execution must consume exactly one
-    // FP32 score per token in addition to the pre-existing route workspace.
     ops::linear_add(x, weight, out, family.policy, projection, workspace, nullptr);
-    cuda_check(cudaDeviceSynchronize(), "synchronize projected linear_add");
+    ops::linear_add(x, weight, legacy_out, family.policy, legacy_workspace, nullptr);
+    ops::linear_add(x, weight, null_out, family.policy, nullptr, null_workspace, nullptr);
+    ops::linear_add(x, weight, zero_out, family.policy, &zero_projection, zero_workspace, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "synchronize projection comparisons");
 
     const std::string label = std::string(family.label) + " T=" + std::to_string(tokens);
     int failures = projected.verify_guards(label);
+    failures += legacy.verify_guards(label + " legacy");
+    failures += null_projection.verify_guards(label + " null");
+    failures += zero_coefficient.verify_guards(label + " zero coefficient");
     if (workspace.used() != 0 || workspace.peak_used() != projected_capacity) {
         std::cerr << label << ": projected workspace was not base + exactly 4*T bytes\n";
         ++failures;
     }
+    if (zero_workspace.used() != 0 || zero_workspace.peak_used() != projected_capacity) {
+        std::cerr << label << ": zero-coefficient workspace was not base + exactly 4*T bytes\n";
+        ++failures;
+    }
 
     std::vector<std::uint16_t> actual(words);
+    std::vector<std::uint16_t> legacy_bits(words);
+    std::vector<std::uint16_t> null_bits(words);
+    std::vector<std::uint16_t> zero_bits(words);
     projected.copy_to_host(actual.data(), projected.bytes());
+    legacy.copy_to_host(legacy_bits.data(), legacy.bytes());
+    null_projection.copy_to_host(null_bits.data(), null_projection.bytes());
+    zero_coefficient.copy_to_host(zero_bits.data(), zero_coefficient.bytes());
+    if (std::equal(legacy_bits.begin(), legacy_bits.end(), initial_residual.begin())) {
+        std::cerr << label << ": patterned fixture produced no observable matmul\n";
+        ++failures;
+    }
+    if (legacy_bits != null_bits || null_workspace.peak_used() != base_capacity) {
+        std::cerr << label << ": null projection changed the existing route\n";
+        ++failures;
+    }
+    if (legacy_bits != zero_bits) {
+        std::size_t mismatch_count = 0;
+        std::size_t first_mismatch = words;
+        for (std::size_t index = 0; index < words; ++index) {
+            if (legacy_bits[index] == zero_bits[index]) { continue; }
+            if (first_mismatch == words) { first_mismatch = index; }
+            ++mismatch_count;
+        }
+        const std::size_t first_token = first_mismatch / kOutputRows;
+        const std::size_t first_row = first_mismatch - first_token * kOutputRows;
+        std::cerr << label << ": zero coefficient changed " << mismatch_count
+                  << " nonzero-matmul BF16 values; first token=" << first_token
+                  << " row=" << first_row << " legacy_bits=" << legacy_bits[first_mismatch]
+                  << " projected_bits=" << zero_bits[first_mismatch]
+                  << " legacy=" << bf16_to_f32(legacy_bits[first_mismatch])
+                  << " projected=" << bf16_to_f32(zero_bits[first_mismatch]) << '\n';
+        ++failures;
+    }
+
     std::vector<double> actual_values;
     std::vector<double> expected_values;
     actual_values.reserve(words);
@@ -243,8 +313,8 @@ int verify_projection(const RouteFamily& family, std::int32_t tokens,
         for (std::int32_t row = 0; row < kOutputRows; ++row) {
             const std::size_t index = static_cast<std::size_t>(token) * kOutputRows + row;
             const float expected = bf16_to_f32(f32_to_bf16(
-                bf16_to_f32(initial_residual[index]) - projection->coefficient * direction[row] *
-                                                          score));
+                bf16_to_f32(legacy_bits[index]) -
+                projection->coefficient * direction[row] * score));
             actual_values.push_back(bf16_to_f32(actual[index]));
             expected_values.push_back(expected);
         }
@@ -266,33 +336,13 @@ int verify_projection(const RouteFamily& family, std::int32_t tokens,
         std::cerr << label << ": max_abs=" << max_absolute << " cosine=" << cosine << '\n';
         ++failures;
     }
-
-    GuardedDeviceBuffer legacy(words * sizeof(std::uint16_t));
-    GuardedDeviceBuffer null_projection(words * sizeof(std::uint16_t));
-    legacy.copy_from_host(initial_residual.data(), legacy.bytes());
-    null_projection.copy_from_host(initial_residual.data(), null_projection.bytes());
-    Tensor legacy_out(legacy.data(), DType::BF16, {kOutputRows, tokens});
-    Tensor null_out(null_projection.data(), DType::BF16, {kOutputRows, tokens});
-    WorkspaceArena legacy_workspace(std::max<std::size_t>(base_capacity, 256));
-    WorkspaceArena null_workspace(std::max<std::size_t>(base_capacity, 256));
-    ops::linear_add(x, weight, legacy_out, family.policy, legacy_workspace, nullptr);
-    ops::linear_add(x, weight, null_out, family.policy, nullptr, null_workspace, nullptr);
-    cuda_check(cudaDeviceSynchronize(), "synchronize null projection comparison");
-    std::vector<std::uint16_t> legacy_bits(words);
-    std::vector<std::uint16_t> null_bits(words);
-    legacy.copy_to_host(legacy_bits.data(), legacy.bytes());
-    null_projection.copy_to_host(null_bits.data(), null_projection.bytes());
-    if (legacy_bits != null_bits || null_workspace.peak_used() != base_capacity) {
-        std::cerr << label << ": null projection changed the existing route\n";
-        ++failures;
-    }
     return failures;
 }
 
 int run_numerical_routes() {
     int failures = 0;
     for (const RouteFamily& family : kRouteFamilies) {
-        auto host_weight = make_zero_weight(family);
+        auto host_weight = make_patterned_projection_weight(family);
         GuardedDeviceBuffer device_weight(host_weight.payload.size());
         device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
         const Weight weight = host_weight.device_weight(device_weight.data());
@@ -320,6 +370,16 @@ int run_numerical_routes() {
                                                static_cast<std::size_t>(family.input_rows) * tokens),
                 std::span<const std::uint16_t>(residual.data(),
                                                static_cast<std::size_t>(kOutputRows) * tokens),
+                signature, direction, weight, device_activation, &projection);
+        }
+        if (family.qtype == QType::NVFP4) {
+            failures += verify_projection(
+                family, kNvfp4SmallTToken,
+                std::span<const std::uint16_t>(
+                    activation.data(),
+                    static_cast<std::size_t>(family.input_rows) * kNvfp4SmallTToken),
+                std::span<const std::uint16_t>(
+                    residual.data(), static_cast<std::size_t>(kOutputRows) * kNvfp4SmallTToken),
                 signature, direction, weight, device_activation, &projection);
         }
     }
