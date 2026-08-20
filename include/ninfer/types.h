@@ -74,6 +74,7 @@ struct LoadProgress {
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
+    std::filesystem::path refusal_projection_path;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);

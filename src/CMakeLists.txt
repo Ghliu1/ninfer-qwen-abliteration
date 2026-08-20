@@ -44,6 +44,12 @@ add_library(ninfer_artifact STATIC
 ninfer_internal_includes(ninfer_artifact)
 target_link_libraries(ninfer_artifact PUBLIC ninfer_core)
 
+# Immutable schema-1 residual-projection metadata and its one-time device upload.
+add_library(ninfer_projection STATIC
+  projection/residual_projection.cpp)
+ninfer_internal_includes(ninfer_projection)
+target_link_libraries(ninfer_projection PUBLIC ninfer_core)
+
 # The warp-specialized SM120 kernel uses setmaxnreg to transfer registers from its
 # producer warpgroup to its consumer warpgroups. Relocatable device code makes ptxas
 # discard that contract, so this self-contained kernel is intentionally compiled in a
@@ -305,6 +311,8 @@ add_library(ninfer_engine STATIC
   runtime/engine/engine.cpp)
 ninfer_internal_includes(ninfer_engine)
 target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_compile_definitions(ninfer_engine PRIVATE
+  NINFER_REQUIRE_QWEN38_PROJECTION=$<BOOL:${NINFER_REQUIRE_QWEN38_PROJECTION}>)
 
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
@@ -313,6 +321,7 @@ add_subdirectory(targets/qwen3_6_35b_a3b)
 target_link_libraries(ninfer_engine
   PRIVATE
     ninfer_artifact
+    ninfer_projection
     ninfer_core
     ninfer_ops
     ninfer_text

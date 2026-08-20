@@ -77,6 +77,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
+           "       [--refusal-projection PATH]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -118,6 +119,11 @@ Options parse_options(int argc, char** argv) {
             options.prompt = value(arg);
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
+        } else if (arg == "--refusal-projection") {
+            options.refusal_projection_path = value(arg);
+            if (options.refusal_projection_path.empty()) {
+                throw std::invalid_argument("--refusal-projection must not be empty");
+            }
         } else if (arg == "--max-new") {
             options.max_new = parse_u32(value(arg), "max-new");
         } else if (arg == "--max-context") {

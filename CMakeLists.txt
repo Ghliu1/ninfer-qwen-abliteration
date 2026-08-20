@@ -16,8 +16,14 @@ project(ninfer LANGUAGES C CXX CUDA)
 
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
+option(NINFER_BUILD_TESTS "Build the NInfer test suite" OFF)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+option(NINFER_REQUIRE_QWEN38_PROJECTION
+  "Require the approved Qwen3.8-27B/NVFP4 refusal projection at startup" OFF)
+if(NINFER_BUILD_TESTS)
+  set(BUILD_TESTING ON CACHE BOOL "Build NInfer tests" FORCE)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

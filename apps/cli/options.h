@@ -14,6 +14,7 @@ struct Options {
     bool help_requested = false;
 
     std::filesystem::path artifact_path;
+    std::filesystem::path refusal_projection_path;
     std::string prompt;
     std::filesystem::path messages_path;
 

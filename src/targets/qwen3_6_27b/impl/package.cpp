@@ -13,11 +13,14 @@ namespace ninfer::targets::qwen3_6_27b::detail {
 
 class LoadPlan::Impl {
 public:
-    Impl(WeightsProfile weights_profile_in, ArtifactLoadPlan target_plan)
-        : weights_profile(weights_profile_in), plan(std::move(target_plan)) {}
+    Impl(WeightsProfile weights_profile_in, ArtifactLoadPlan target_plan,
+         std::optional<ResidualProjectionTable> refusal_projection_in)
+        : weights_profile(weights_profile_in), plan(std::move(target_plan)),
+          refusal_projection(std::move(refusal_projection_in)) {}
 
     WeightsProfile weights_profile;
     ArtifactLoadPlan plan;
+    std::optional<ResidualProjectionTable> refusal_projection;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -101,16 +104,20 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    auto refusal_projection =
+        detail::load_refusal_projection(weights_profile, options.refusal_projection_path);
+    auto artifact_plan =
+        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options));
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile,
-        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+        weights_profile, std::move(artifact_plan), std::move(refusal_projection)));
 }
 
 std::unique_ptr<Package::LoadedModel>
 Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
     auto impl = std::make_unique<LoadedModel::Impl>(
-        plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
+        plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized),
+        std::move(plan.impl_->refusal_projection));
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }

@@ -20,6 +20,9 @@
 namespace ninfer::targets::qwen3_6_27b::detail {
 namespace {
 
+constexpr std::string_view kApprovedQwen38ArtifactSha256 =
+    "bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32";
+
 using artifact::NumericFormat;
 
 bool is_full_layer(std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; }
@@ -410,6 +413,31 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 } // namespace
 
+bool qwen38_projection_required_by_build() noexcept {
+#if NINFER_REQUIRE_QWEN38_PROJECTION
+    return true;
+#else
+    return false;
+#endif
+}
+
+std::optional<ResidualProjectionTable>
+load_refusal_projection(WeightsProfile weights_profile, const std::filesystem::path& path) {
+    const bool is_qwen38_nvfp4 = weights_profile == WeightsProfile::Qwen38Nvfp4;
+    if (!path.empty() && !is_qwen38_nvfp4) {
+        throw ProjectionError(
+            "--refusal-projection is accepted only for qwen3.8-27b/nvfp4");
+    }
+    if (path.empty()) {
+        if (is_qwen38_nvfp4 && qwen38_projection_required_by_build()) {
+            throw ProjectionError(
+                "qwen3.8-27b/nvfp4 requires --refusal-projection in this build");
+        }
+        return std::nullopt;
+    }
+    return ResidualProjectionTable::load(path, kApprovedQwen38ArtifactSha256);
+}
+
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
@@ -489,8 +517,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     return load_plan;
 }
 
-LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
+LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
+                                 std::optional<ResidualProjectionTable> projection)
+    : backing(std::move(materialized)), refusal_projection(std::move(projection)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();

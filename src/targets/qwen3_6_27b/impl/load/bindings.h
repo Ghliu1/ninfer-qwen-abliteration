@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ninfer/targets/qwen3_6_27b/package.h>
+#include <ninfer/projection/residual_projection.h>
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/model_view.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
@@ -13,6 +14,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <optional>
 #include <utility>
 #include <variant>
 
@@ -131,6 +134,10 @@ struct ArtifactLoadPlan {
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features);
 
+[[nodiscard]] bool qwen38_projection_required_by_build() noexcept;
+[[nodiscard]] std::optional<ResidualProjectionTable>
+load_refusal_projection(WeightsProfile weights_profile, const std::filesystem::path& path);
+
 struct DensePostMixerPayload {
     Weight gate_up;
     Weight down;
@@ -197,7 +204,8 @@ using MtpWeights           = RuntimeModelView::MtpLayer;
 
 class LoadedModelData {
 public:
-    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
+                    std::optional<ResidualProjectionTable> refusal_projection);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
@@ -207,13 +215,16 @@ public:
     artifact::MaterializedArtifact backing;
     qwen3_6::FrontendResources frontend;
     RuntimeModelView runtime;
+    std::optional<ResidualProjectionTable> refusal_projection;
 };
 
 class LoadedModel::Impl {
 public:
     Impl(WeightsProfile weights_profile_in, BindingPlan plan,
-         artifact::MaterializedArtifact materialized)
-        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
+         artifact::MaterializedArtifact materialized,
+         std::optional<ResidualProjectionTable> refusal_projection)
+        : weights_profile(weights_profile_in),
+          data(std::move(plan), std::move(materialized), std::move(refusal_projection)) {}
 
     WeightsProfile weights_profile;
     LoadedModelData data;

@@ -64,6 +64,7 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
+           "[--refusal-projection PATH] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
@@ -130,6 +131,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         };
         if (arg == "--host") {
             options.host = require_value("--host");
+        } else if (arg == "--refusal-projection") {
+            options.refusal_projection_path = require_value("--refusal-projection");
+            if (options.refusal_projection_path.empty()) {
+                throw std::invalid_argument("--refusal-projection must not be empty");
+            }
         } else if (arg == "--port") {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
         } else if (arg == "--api-key") {

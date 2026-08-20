@@ -58,6 +58,15 @@ ninfer_add_test(ninfer_artifact_reader_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
+ninfer_add_test(residual_projection_loader_test
+  SOURCES projection/residual_projection_loader_test.cpp
+          ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_serve CUDA::cudart)
+set_tests_properties(residual_projection_loader_test PROPERTIES SKIP_RETURN_CODE 77)
+target_include_directories(residual_projection_loader_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 ninfer_add_test(ninfer_media_decode_test
   SOURCES test_media_decode.cpp
   LIBRARIES ninfer_media_decode)
