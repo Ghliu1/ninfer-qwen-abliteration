@@ -7,15 +7,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
+#include <fcntl.h>
 #include <limits>
 #include <set>
 #include <span>
 #include <string>
+#include <unistd.h>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -50,7 +52,6 @@ constexpr std::array<std::string_view, 10> kRecordFields{
 
 using Digest = projection_internal::Sha256Digest;
 using projection_internal::sha256;
-using projection_internal::sha256_file;
 
 struct Header {
     std::uint32_t version = 0;
@@ -349,14 +350,48 @@ std::vector<ParsedRecord> validate_manifest(const Json& manifest, std::uint64_t 
     return records;
 }
 
-void read_exact(std::ifstream& input, void* destination, std::size_t bytes, const char* label) {
-    if (bytes > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
-        throw ProjectionError(std::string(label) + " exceeds streamsize");
+std::vector<std::uint8_t> read_bounded_file(const std::filesystem::path& path,
+                                            std::uint64_t maximum_bytes,
+                                            std::string_view label) {
+    class FileDescriptor {
+    public:
+        explicit FileDescriptor(const std::filesystem::path& source)
+            : descriptor_(::open(source.c_str(), O_RDONLY | O_CLOEXEC)) {}
+
+        ~FileDescriptor() {
+            if (descriptor_ >= 0) { (void)::close(descriptor_); }
+        }
+
+        FileDescriptor(const FileDescriptor&)            = delete;
+        FileDescriptor& operator=(const FileDescriptor&) = delete;
+
+        [[nodiscard]] int get() const noexcept { return descriptor_; }
+
+    private:
+        int descriptor_ = -1;
+    };
+
+    FileDescriptor input(path);
+    if (input.get() < 0) { throw ProjectionError("could not open " + std::string(label)); }
+
+    std::vector<std::uint8_t> encoded;
+    std::array<std::uint8_t, 64ULL << 10> buffer{};
+    while (true) {
+        ssize_t count = -1;
+        do {
+            count = ::read(input.get(), buffer.data(), buffer.size());
+        } while (count < 0 && errno == EINTR);
+        if (count < 0) {
+            throw ProjectionError("could not read complete " + std::string(label));
+        }
+        if (count == 0) { break; }
+        const auto bytes = static_cast<std::size_t>(count);
+        if (encoded.size() > maximum_bytes || bytes > maximum_bytes - encoded.size()) {
+            throw ProjectionError(std::string(label) + " exceeds the bounded schema");
+        }
+        encoded.insert(encoded.end(), buffer.begin(), buffer.begin() + bytes);
     }
-    input.read(static_cast<char*>(destination), static_cast<std::streamsize>(bytes));
-    if (!input || input.gcount() != static_cast<std::streamsize>(bytes)) {
-        throw ProjectionError(std::string("could not read complete ") + label);
-    }
+    return encoded;
 }
 
 void validate_payload(const PinnedHostBuffer& payload,
@@ -468,25 +503,17 @@ void authenticate_conversion_report(const std::filesystem::path& sidecar_path,
                                     std::string_view expected_model_sha256) {
     std::filesystem::path report_path = sidecar_path;
     report_path.replace_extension(".conversion.json");
-    std::error_code file_error;
-    const std::uint64_t report_bytes = std::filesystem::file_size(report_path, file_error);
-    if (file_error || report_bytes == 0 || report_bytes > kMaximumReportBytes) {
+    const std::vector<std::uint8_t> encoded_bytes =
+        read_bounded_file(report_path, kMaximumReportBytes,
+                          "approved projection conversion report");
+    if (encoded_bytes.empty()) {
         throw ProjectionError("approved projection conversion report is missing or unbounded");
     }
-    try {
-        if (sha256_file(report_path) != parse_digest(kApprovedReportSha256)) {
-            throw ProjectionError("projection conversion report is not the approved report");
-        }
-    } catch (const ProjectionError&) {
-        throw;
-    } catch (const std::exception& error) {
-        throw ProjectionError("could not authenticate projection conversion report: " +
-                              std::string(error.what()));
+    if (sha256(encoded_bytes) != parse_digest(kApprovedReportSha256)) {
+        throw ProjectionError("projection conversion report is not the approved report");
     }
-    std::ifstream input(report_path, std::ios::binary);
-    if (!input) { throw ProjectionError("could not open approved projection conversion report"); }
-    std::string encoded(static_cast<std::size_t>(report_bytes), '\0');
-    read_exact(input, encoded.data(), encoded.size(), "projection conversion report");
+    const std::string encoded(reinterpret_cast<const char*>(encoded_bytes.data()),
+                              encoded_bytes.size());
     validate_report_identity(parse_manifest(encoded), expected_model_sha256);
 }
 
@@ -523,18 +550,16 @@ ResidualProjectionTable
 ResidualProjectionTable::load(const std::filesystem::path& path,
                               std::string_view expected_model_sha256) {
     if (path.empty()) { throw ProjectionError("projection sidecar path must not be empty"); }
-    std::error_code file_error;
-    const std::uint64_t file_bytes = std::filesystem::file_size(path, file_error);
-    if (file_error) {
-        throw ProjectionError("could not stat projection sidecar: " + file_error.message());
-    }
+    constexpr std::uint64_t kMaximumSidecarBytes =
+        kHeaderBytes + kMaximumManifestBytes + kPayloadAlignment + kMaximumPayloadBytes;
+    const std::vector<std::uint8_t> encoded =
+        read_bounded_file(path, kMaximumSidecarBytes, "projection sidecar");
+    const std::uint64_t file_bytes = encoded.size();
     if (file_bytes < kHeaderBytes) {
         throw ProjectionError("projection sidecar is shorter than its header");
     }
-    std::ifstream input(path, std::ios::binary);
-    if (!input) { throw ProjectionError("could not open projection sidecar"); }
     std::array<std::uint8_t, kHeaderBytes> raw_header{};
-    read_exact(input, raw_header.data(), raw_header.size(), "projection header");
+    std::copy_n(encoded.data(), raw_header.size(), raw_header.data());
     const Header header = parse_header(raw_header);
     if (header.version != kSchemaVersion) {
         throw ProjectionError("unsupported projection sidecar schema version");
@@ -558,8 +583,9 @@ ResidualProjectionTable::load(const std::filesystem::path& path,
         throw ProjectionError("projection direction SHA-256 is not the approved source");
     }
 
-    std::string manifest(static_cast<std::size_t>(header.manifest_bytes), '\0');
-    read_exact(input, manifest.data(), manifest.size(), "projection manifest");
+    const std::string manifest(
+        reinterpret_cast<const char*>(encoded.data() + kHeaderBytes),
+        static_cast<std::size_t>(header.manifest_bytes));
     const auto manifest_span = std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(manifest.data()), manifest.size());
     if (sha256(manifest_span) != header.manifest_sha) {
@@ -570,19 +596,11 @@ ResidualProjectionTable::load(const std::filesystem::path& path,
 
     auto impl = std::make_unique<Impl>(static_cast<std::size_t>(header.payload_bytes),
                                       std::move(records));
-    input.seekg(static_cast<std::streamoff>(payload_offset), std::ios::beg);
-    if (!input) { throw ProjectionError("could not seek to projection payload"); }
-    read_exact(input, impl->host.data(), impl->host.size(), "projection payload");
+    std::memcpy(impl->host.data(), encoded.data() + static_cast<std::size_t>(payload_offset),
+                impl->host.size());
     validate_payload(impl->host, impl->records);
-    try {
-        if (sha256_file(path) != parse_digest(kApprovedSidecarSha256)) {
-            throw ProjectionError("projection file is not the approved sidecar");
-        }
-    } catch (const ProjectionError&) {
-        throw;
-    } catch (const std::exception& error) {
-        throw ProjectionError("could not authenticate complete projection sidecar: " +
-                              std::string(error.what()));
+    if (sha256(encoded) != parse_digest(kApprovedSidecarSha256)) {
+        throw ProjectionError("projection file is not the approved sidecar");
     }
     authenticate_conversion_report(path, expected_model_sha256);
     impl->device.copy_from_host(impl->host.data(), impl->host.size());

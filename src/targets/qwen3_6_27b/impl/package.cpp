@@ -47,6 +47,15 @@ LoadedModel::LoadedModel(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(
 
 LoadedModel::~LoadedModel() = default;
 
+ResidualProjectionView LoadedModel::refusal_projection(std::uint32_t layer,
+                                                       ProjectionSite site) const {
+    if (impl_ == nullptr) { throw std::logic_error("loaded model is empty"); }
+    if (!impl_->data.refusal_projection.has_value()) {
+        throw ProjectionError("loaded model does not own a refusal projection");
+    }
+    return impl_->data.refusal_projection->view(layer, site);
+}
+
 } // namespace ninfer::targets::qwen3_6_27b::detail
 
 namespace ninfer::targets::qwen3_6_27b {

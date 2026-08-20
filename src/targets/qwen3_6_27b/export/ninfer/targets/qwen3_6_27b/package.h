@@ -66,6 +66,9 @@ class LoadedModel {
 public:
     ~LoadedModel();
 
+    [[nodiscard]] ResidualProjectionView refusal_projection(std::uint32_t layer,
+                                                            ProjectionSite site) const;
+
     LoadedModel(const LoadedModel&)            = delete;
     LoadedModel& operator=(const LoadedModel&) = delete;
     LoadedModel(LoadedModel&&)                 = delete;

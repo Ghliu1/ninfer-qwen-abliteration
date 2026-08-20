@@ -1,6 +1,8 @@
 #include "artifact/binder.h"
+#include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "artifact_fixture.h"
+#include "core/device.h"
 
 #include <ninfer/projection/residual_projection.h>
 #include <ninfer/targets/qwen3_6_27b/package.h>
@@ -74,6 +76,22 @@ int verify_real_plan_load(const std::filesystem::path& artifact_path,
         before_move.signature != after_move.signature ||
         after_move.direction_count != 5120 || after_move.signature_count != 6144) {
         std::cerr << "Package::LoadPlan did not retain stable projection ownership\n";
+        return 1;
+    }
+    ninfer::DeviceContext device(0);
+    auto materialized = ninfer::artifact::materialize(reader, moved.materialization(), device);
+    auto loaded = Package::construct_loaded_model(std::move(moved), std::move(materialized));
+    const auto after_construction =
+        loaded->refusal_projection(3, ninfer::ProjectionSite::AttentionOutput);
+    if (after_construction.direction != after_move.direction ||
+        after_construction.signature != after_move.signature ||
+        after_construction.direction_count != 5120 || after_construction.signature_count != 6144) {
+        std::cerr << "LoadedModelData did not retain stable projection ownership\n";
+        return 1;
+    }
+    const auto mlp = loaded->refusal_projection(63, ninfer::ProjectionSite::MlpDown);
+    if (mlp.direction_count != 5120 || mlp.signature_count != 17408) {
+        std::cerr << "LoadedModelData retained an incomplete projection claim map\n";
         return 1;
     }
     return 0;

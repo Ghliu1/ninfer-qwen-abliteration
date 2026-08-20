@@ -7,15 +7,91 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
+#include <atomic>
+#include <cerrno>
 #include <cmath>
+#include <cstdarg>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
+#include <fcntl.h>
+#include <fstream>
 #include <iostream>
+#include <limits.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
+
+namespace projection_open_swap {
+
+std::array<char, PATH_MAX> watched_path{};
+std::array<char, PATH_MAX> replacement_link{};
+std::atomic<bool> armed{false};
+std::atomic<bool> fired{false};
+std::atomic<int> swap_error{0};
+
+void arm(const std::filesystem::path& watched, const std::filesystem::path& replacement) {
+    const std::string watched_text = watched.string();
+    const std::string replacement_text = replacement.string();
+    if (watched_text.size() >= watched_path.size() ||
+        replacement_text.size() >= replacement_link.size()) {
+        throw std::runtime_error("projection swap test path exceeds PATH_MAX");
+    }
+    std::fill(watched_path.begin(), watched_path.end(), '\0');
+    std::fill(replacement_link.begin(), replacement_link.end(), '\0');
+    std::copy(watched_text.begin(), watched_text.end(), watched_path.begin());
+    std::copy(replacement_text.begin(), replacement_text.end(), replacement_link.begin());
+    swap_error.store(0);
+    fired.store(false);
+    armed.store(true);
+}
+
+void after_open(const char* pathname, int descriptor) noexcept {
+    if (descriptor < 0 || pathname == nullptr || !armed.load() ||
+        std::strcmp(pathname, watched_path.data()) != 0 || !armed.exchange(false)) {
+        return;
+    }
+    if (::rename(replacement_link.data(), watched_path.data()) != 0) {
+        swap_error.store(errno);
+    }
+    fired.store(true);
+}
+
+int raw_open(const char* pathname, int flags, mode_t mode) noexcept {
+    const int descriptor = static_cast<int>(
+        ::syscall(SYS_openat, AT_FDCWD, pathname, flags, mode));
+    after_open(pathname, descriptor);
+    return descriptor;
+}
+
+} // namespace projection_open_swap
+
+extern "C" int open(const char* pathname, int flags, ...) {
+    mode_t mode = 0;
+    if ((flags & O_CREAT) != 0) {
+        va_list arguments;
+        va_start(arguments, flags);
+        mode = static_cast<mode_t>(va_arg(arguments, int));
+        va_end(arguments);
+    }
+    return projection_open_swap::raw_open(pathname, flags, mode);
+}
+
+extern "C" int open64(const char* pathname, int flags, ...) {
+    mode_t mode = 0;
+    if ((flags & O_CREAT) != 0) {
+        va_list arguments;
+        va_start(arguments, flags);
+        mode = static_cast<mode_t>(va_arg(arguments, int));
+        va_end(arguments);
+    }
+    return projection_open_swap::raw_open(pathname, flags, mode);
+}
 
 namespace {
 
@@ -107,6 +183,75 @@ std::filesystem::path make_fixture(const TemporaryDirectory& temporary, std::str
         throw std::runtime_error("projection fixture generator failed for " + std::string(mode));
     }
     return output;
+}
+
+std::filesystem::path conversion_report_path(std::filesystem::path sidecar) {
+    sidecar.replace_extension(".conversion.json");
+    return sidecar;
+}
+
+int verify_swap_fired(std::string_view label) {
+    if (!projection_open_swap::fired.load()) {
+        std::cerr << label << " did not intercept the intended file open\n";
+        return 1;
+    }
+    if (projection_open_swap::swap_error.load() != 0) {
+        std::cerr << label << " could not replace the symlink: "
+                  << std::strerror(projection_open_swap::swap_error.load()) << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+int verify_sidecar_symlink_swap_rejected(const TemporaryDirectory& temporary,
+                                         const std::filesystem::path& approved_sidecar) {
+    const std::filesystem::path consumed_sidecar = make_fixture(temporary, "valid");
+    const std::filesystem::path attack_path = temporary.path() / "sidecar_swap.ninferproj";
+    const std::filesystem::path replacement = temporary.path() / "sidecar_swap.next";
+    std::filesystem::create_symlink(consumed_sidecar, attack_path);
+    std::filesystem::create_symlink(approved_sidecar, replacement);
+    std::filesystem::create_symlink(conversion_report_path(approved_sidecar),
+                                    conversion_report_path(attack_path));
+    projection_open_swap::arm(attack_path, replacement);
+    int failures = expect_projection_error_containing(
+        [&] { (void)ResidualProjectionTable::load(attack_path, kModelSha); },
+        "sidecar symlink replacement", "approved sidecar");
+    failures += verify_swap_fired("sidecar symlink replacement");
+    return failures;
+}
+
+int verify_report_symlink_swap_uses_opened_bytes(const TemporaryDirectory& temporary,
+                                                 const std::filesystem::path& approved_sidecar) {
+    const std::filesystem::path attack_sidecar = temporary.path() / "report_swap.ninferproj";
+    const std::filesystem::path attack_report = conversion_report_path(attack_sidecar);
+    const std::filesystem::path replacement = temporary.path() / "report_swap.next";
+    const std::filesystem::path forged_report = temporary.path() / "forged_report.json";
+    const std::filesystem::path approved_report = conversion_report_path(approved_sidecar);
+    std::filesystem::create_symlink(approved_sidecar, attack_sidecar);
+    std::filesystem::create_symlink(approved_report, attack_report);
+    {
+        const auto bytes = std::filesystem::file_size(approved_report);
+        std::string forged(static_cast<std::size_t>(bytes), ' ');
+        constexpr std::string_view invalid = R"({"schema_version":1})";
+        std::copy(invalid.begin(), invalid.end(), forged.begin());
+        std::ofstream output(forged_report, std::ios::binary | std::ios::trunc);
+        output.write(forged.data(), static_cast<std::streamsize>(forged.size()));
+    }
+    std::filesystem::create_symlink(forged_report, replacement);
+    projection_open_swap::arm(attack_report, replacement);
+    int failures = 0;
+    try {
+        auto table = ResidualProjectionTable::load(attack_sidecar, kModelSha);
+        const auto view = table.view(3, ProjectionSite::AttentionOutput);
+        failures += check(view.direction_count == 5120 && view.signature_count == 6144,
+                          "opened conversion report did not retain the approved identity");
+    } catch (const std::exception& error) {
+        std::cerr << "report symlink replacement redirected consumed bytes: " << error.what()
+                  << '\n';
+        ++failures;
+    }
+    failures += verify_swap_fired("report symlink replacement");
+    return failures;
 }
 
 std::vector<char*> argv(std::vector<std::string>& arguments) {
@@ -281,6 +426,8 @@ int main() {
     failures += expect_projection_error(
         [&] { (void)ResidualProjectionTable::load(valid, "not-a-sha256"); },
         "malformed expected model SHA-256");
+    failures += verify_sidecar_symlink_swap_rejected(temporary, valid);
+    failures += verify_report_symlink_swap_uses_opened_bytes(temporary, valid);
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

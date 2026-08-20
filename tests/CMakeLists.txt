@@ -67,6 +67,7 @@ set_tests_properties(residual_projection_loader_test PROPERTIES SKIP_RETURN_CODE
 target_include_directories(residual_projection_loader_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+target_link_options(residual_projection_loader_test PRIVATE -Wl,--export-dynamic)
 ninfer_add_test(projection_integrity_test
   SOURCES projection/projection_integrity_test.cpp
   LIBRARIES ninfer_projection)
