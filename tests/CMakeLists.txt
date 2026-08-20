@@ -68,6 +68,18 @@ target_include_directories(residual_projection_loader_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_options(residual_projection_loader_test PRIVATE -Wl,--export-dynamic)
+ninfer_add_test(qwen38_projection_integration_test
+  SOURCES projection/qwen38_projection_integration_test.cpp
+  LIBRARIES ninfer_engine ninfer_ops CUDA::cudart)
+target_include_directories(qwen38_projection_integration_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(qwen38_projection_integration_test PROPERTIES SKIP_RETURN_CODE 77)
+target_link_options(qwen38_projection_integration_test PRIVATE
+  -Wl,--wrap=_ZNK6ninfer23ResidualProjectionTable4viewEjNS_14ProjectionSiteE
+  -Wl,--wrap=_ZN6ninfer3ops6linearERKNS_6TensorERKNS_6WeightERS1_P11CUstream_st
+  -Wl,--wrap=_ZN6ninfer3ops8silu_mulERKNS_6TensorES3_RS1_P11CUstream_st
+  -Wl,--wrap=_ZN6ninfer3ops12residual_addERKNS_6TensorERS1_P11CUstream_st)
 ninfer_add_test(projection_integrity_test
   SOURCES projection/projection_integrity_test.cpp
   LIBRARIES ninfer_projection)

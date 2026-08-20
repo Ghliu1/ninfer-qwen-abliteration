@@ -44,6 +44,61 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
+template <class TargetVariant>
+void invoke_attention_output_projection(
+    const Tensor& attention, const Weight& weight, Tensor& residual, std::uint32_t layer,
+    const ResidualProjectionTable* projection, Phase phase, WorkspaceArena& workspace,
+    cudaStream_t stream) {
+    if constexpr (requires {
+                      TargetVariant::attention_output_projection(
+                          attention, weight, residual, layer, projection, phase, workspace, stream);
+                  }) {
+        TargetVariant::attention_output_projection(attention, weight, residual, layer, projection,
+                                                   phase, workspace, stream);
+    } else {
+        (void)layer;
+        (void)projection;
+        TargetVariant::attention_output_projection(attention, weight, residual, phase, workspace,
+                                                   stream);
+    }
+}
+
+template <class TargetVariant>
+void invoke_gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
+                                  std::uint32_t layer,
+                                  const ResidualProjectionTable* projection, Phase phase,
+                                  WorkspaceArena& workspace, cudaStream_t stream) {
+    if constexpr (requires {
+                      TargetVariant::gdn_output_projection(hidden, weight, residual, layer,
+                                                           projection, phase, workspace, stream);
+                  }) {
+        TargetVariant::gdn_output_projection(hidden, weight, residual, layer, projection, phase,
+                                             workspace, stream);
+    } else {
+        (void)layer;
+        (void)projection;
+        TargetVariant::gdn_output_projection(hidden, weight, residual, phase, workspace, stream);
+    }
+}
+
+template <class TargetVariant>
+void invoke_post_mixer(const Tensor& hidden, const typename TargetVariant::PostMixerWeights& weights,
+                       Tensor& residual, std::uint32_t layer,
+                       const ResidualProjectionTable* projection, Phase phase,
+                       WorkspaceArena& workspace, cudaStream_t stream) {
+    if constexpr (requires {
+                      TargetVariant::post_mixer(hidden, weights, residual, layer, projection, phase,
+                                                workspace, stream);
+                  }) {
+        TargetVariant::post_mixer(hidden, weights, residual, layer, projection, phase, workspace,
+                                  stream);
+    } else {
+        (void)layer;
+        (void)projection;
+        TargetVariant::post_mixer(hidden, weights, residual, phase, workspace, stream);
+    }
+}
+
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
         destination.data == nullptr) {
@@ -789,7 +844,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, int layer, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     if (active_gqa_envelope_ == nullptr) {
@@ -847,10 +902,12 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     }
     ops::sigmoid_mul(gate, a, s);
 
-    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    invoke_attention_output_projection<Variant>(
+        a.view({kCfg.q_size, T}), *w.o_proj, x, static_cast<std::uint32_t>(layer),
+        weights_.refusal_projection, ph, work_, s);
 }
 
-void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
+void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, int layer, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
@@ -952,16 +1009,19 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     ops::gated_rmsnorm(o, *w.gdn_norm, z, kCfg.rms_eps, on, s);
 
-    Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
+    invoke_gdn_output_projection<Variant>(
+        on.view({kCfg.value_dim, T}), *w.out_proj, x, static_cast<std::uint32_t>(layer),
+        weights_.refusal_projection, ph, work_, s);
 }
 
-void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
+void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, int layer, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
-    Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+    invoke_post_mixer<Variant>(h, *m.payload, x, static_cast<std::uint32_t>(layer),
+                               weights_.refusal_projection, ph, work_, s);
 }
 
 template <class Tap>
@@ -979,14 +1039,14 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
-                attn_mix(full, x, fidx, ph);
+                attn_mix(full, x, fidx, layer, ph);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                mlp_tail(full.post_attn_norm, full.mlp, x, ph);
+                mlp_tail(full.post_attn_norm, full.mlp, x, layer, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
@@ -1000,14 +1060,14 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
                     static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
-                gdn_mix(gdn, x, gidx, ph);
+                gdn_mix(gdn, x, gidx, layer, ph);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
+                mlp_tail(gdn.post_attn_norm, gdn.mlp, x, layer, ph);
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }

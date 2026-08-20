@@ -567,6 +567,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
+    runtime.refusal_projection =
+        refusal_projection.has_value() ? &*refusal_projection : nullptr;
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;

@@ -97,7 +97,7 @@ std::size_t gdn_record_workspace_bytes(const Tensor& hidden,
 
 std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
                                        ops::LinearPolicy policy, std::int32_t first,
-                                       std::int32_t last) {
+                                       std::int32_t last, bool projected) {
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {TextConfig::intermediate, last});
     {
@@ -107,13 +107,24 @@ std::size_t post_mixer_workspace_bytes(QType gate_up_qtype, QType down_qtype,
     }
     {
         auto scope = layout.scope();
-        (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-            down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last));
+        std::size_t bytes = ops::linear_add_workspace_capacity_bytes(
+            down_qtype, TextConfig::hidden, TextConfig::intermediate, policy, first, last);
+        if (projected) { bytes += sizeof(float) * static_cast<std::size_t>(last); }
+        (void)layout.alloc_bytes(bytes);
     }
     return layout.peak_bytes(1);
 }
 
 } // namespace
+
+ProjectionSite Variant::mixer_projection_site(std::uint32_t layer) {
+    if (layer >= static_cast<std::uint32_t>(TextConfig::layers)) {
+        throw std::out_of_range("Qwen3.8 projection layer is outside [0,63]");
+    }
+    return TextConfig::is_full_attention(static_cast<int>(layer))
+               ? ProjectionSite::AttentionOutput
+               : ProjectionSite::GdnOutput;
+}
 
 std::vector<GraphExecutionProfile> Variant::ordinary_graph_profiles(std::uint32_t capacity) {
     // E+1 is the one-token visible window. Early ranges limit empty producer CTAs; later ranges
@@ -170,9 +181,19 @@ void Variant::attention_projection(const Tensor& hidden,
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,
-                                          Tensor& residual, qwen3_6::TextPhase,
-                                          WorkspaceArena& workspace, cudaStream_t stream) {
-    ops::linear_add(attention, weight, residual, text_policy(weight), workspace, stream);
+                                          Tensor& residual, std::uint32_t layer,
+                                          const ResidualProjectionTable* projection,
+                                          qwen3_6::TextPhase, WorkspaceArena& workspace,
+                                          cudaStream_t stream) {
+    if (mixer_projection_site(layer) != ProjectionSite::AttentionOutput) {
+        throw std::invalid_argument("attention projection received a GDN layer identity");
+    }
+    ResidualProjectionView view{};
+    if (projection != nullptr) {
+        view = projection->view(layer, ProjectionSite::AttentionOutput);
+    }
+    ops::linear_add(attention, weight, residual, text_policy(weight),
+                    projection != nullptr ? &view : nullptr, workspace, stream);
 }
 
 void Variant::mtp_attention_projection(const Tensor& hidden,
@@ -269,9 +290,17 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
+                                    std::uint32_t layer,
+                                    const ResidualProjectionTable* projection,
                                     qwen3_6::TextPhase, WorkspaceArena& workspace,
                                     cudaStream_t stream) {
-    ops::linear_add(hidden, weight, residual, text_policy(weight), workspace, stream);
+    if (mixer_projection_site(layer) != ProjectionSite::GdnOutput) {
+        throw std::invalid_argument("GDN projection received an attention layer identity");
+    }
+    ResidualProjectionView view{};
+    if (projection != nullptr) { view = projection->view(layer, ProjectionSite::GdnOutput); }
+    ops::linear_add(hidden, weight, residual, text_policy(weight),
+                    projection != nullptr ? &view : nullptr, workspace, stream);
 }
 
 void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
@@ -292,13 +321,17 @@ void Variant::gdn_norm_control_projection(const Tensor& residual, const Tensor& 
 }
 
 void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
+                         std::uint32_t layer, const ResidualProjectionTable* projection,
                          qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+    (void)mixer_projection_site(layer);
     auto scope        = workspace.scope();
     Tensor activation = workspace.alloc(DType::BF16, {TextConfig::intermediate, hidden.ne[1]});
     ops::linear_swiglu(hidden, weights.gate_up, activation, text_policy(weights.gate_up), workspace,
                        stream);
-    ops::linear_add(activation, weights.down, residual, text_policy(weights.down), workspace,
-                    stream);
+    ResidualProjectionView view{};
+    if (projection != nullptr) { view = projection->view(layer, ProjectionSite::MlpDown); }
+    ops::linear_add(activation, weights.down, residual, text_policy(weights.down),
+                    projection != nullptr ? &view : nullptr, workspace, stream);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
@@ -371,7 +404,8 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
     case WeightsProfile::Qwen38Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::query_size,
-                                                        kFp8TextPolicy, first, last);
+                                                        kFp8TextPolicy, first, last) +
+               sizeof(float) * static_cast<std::size_t>(last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -462,7 +496,8 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     case WeightsProfile::Qwen38Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::value_dim,
-                                                        kFp8TextPolicy, first, last);
+                                                        kFp8TextPolicy, first, last) +
+               sizeof(float) * static_cast<std::size_t>(last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -481,15 +516,16 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         return post_mixer_workspace_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S,
-                                          ops::LinearPolicy::A16Only, first, last);
+                                          ops::LinearPolicy::A16Only, first, last, false);
     case WeightsProfile::Qwen36Nvfp4:
         return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
-                                          last);
+                                          last, false);
     case WeightsProfile::Qwen38Nvfp4: {
-        const std::size_t nvfp4 =
-            post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last);
+        const std::size_t nvfp4 = post_mixer_workspace_bytes(
+            QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last, true);
         const std::size_t fp8 = post_mixer_workspace_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S, kFp8TextPolicy, first, last);
+            QType::FP8_E4M3FN_ROW_BF16S, QType::FP8_E4M3FN_ROW_BF16S, kFp8TextPolicy, first, last,
+            true);
         return std::max(nvfp4, fp8);
     }
     }

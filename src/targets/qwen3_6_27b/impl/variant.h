@@ -43,8 +43,10 @@ struct Variant {
                                      qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                      cudaStream_t stream);
     static void attention_output_projection(const Tensor& attention, const Weight& weight,
-                                            Tensor& residual, qwen3_6::TextPhase phase,
-                                            WorkspaceArena& workspace, cudaStream_t stream);
+                                            Tensor& residual, std::uint32_t layer,
+                                            const ResidualProjectionTable* projection,
+                                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
+                                            cudaStream_t stream);
     static void mtp_attention_projection(const Tensor& hidden,
                                          const MtpAttentionProjectionWeights& weights,
                                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
@@ -71,6 +73,8 @@ struct Variant {
         Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate,
         qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream);
     static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
+                                      std::uint32_t layer,
+                                      const ResidualProjectionTable* projection,
                                       qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                       cudaStream_t stream);
     static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
@@ -78,6 +82,7 @@ struct Variant {
                                             Tensor& hidden, Tensor& g, Tensor& beta,
                                             WorkspaceArena& workspace, cudaStream_t stream);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
+                           std::uint32_t layer, const ResidualProjectionTable* projection,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
@@ -117,6 +122,8 @@ struct Variant {
                                         std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                                              std::int32_t last);
+
+    [[nodiscard]] static ProjectionSite mixer_projection_site(std::uint32_t layer);
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);

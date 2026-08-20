@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ninfer/projection/residual_projection.h>
 #include <ninfer/targets/qwen3_6/startup_features.h>
 #include <ninfer/targets/qwen3_6/vision.h>
 
@@ -88,6 +89,7 @@ struct ModelView {
     using DFlash    = DFlashPayload;
 
     DeviceArena* weights_arena = nullptr;
+    const ResidualProjectionTable* refusal_projection = nullptr;
     Weight token_embedding;
     std::array<FullLayer, FullAttentionLayers> full_layers;
     std::array<GdnLayer, GdnLayers> gdn_layers;
