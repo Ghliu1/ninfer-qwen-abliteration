@@ -52,7 +52,8 @@ int main() {
     options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens       = 3;
     options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
-    options.enable_vision                  = false;
+    options.enable_vision                  = true;
+    options.max_merged_vision_tokens       = 4096;
     options.allow_prefix_reuse             = false;
     options.preserve_thinking              = true;
     options.sampling_overrides.temperature = 0.6F;
@@ -132,9 +133,13 @@ int main() {
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
                       "request log path missing");
     failures += check(server.at("engine").at("kv_cache") == "int8-group64", "KV type missing");
-    failures += check(server.at("engine").at("vision") == false, "Vision state missing");
+    failures += check(server.at("engine").at("vision") == true, "Vision state missing");
+    failures += check(server.at("engine").at("max_merged_vision_tokens") == 4096,
+                      "merged Vision limit missing");
     failures += check(server.at("engine").at("speculative_backend") == "mtp",
                       "speculative backend missing");
+    failures += check(server.at("engine").at("speculative_draft_window") == 3,
+                      "fixed speculative draft window missing");
     failures +=
         check(server.at("engine").at("proposal_head") == "optimized", "proposal head missing");
     failures +=
@@ -267,6 +272,8 @@ int main() {
     outcome.metrics.speculative_accepted_tokens = 720;
     outcome.metrics.speculative_fallback_steps  = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.metrics.speculative_committed_tokens = 1023;
+    outcome.metrics.speculative_decode_seconds   = outcome.metrics.decode_seconds;
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
@@ -291,11 +298,23 @@ int main() {
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");
+    failures += check(done.at("speculative").at("rounds") == 300,
+                      "speculative round count missing");
+    failures += check(done.at("speculative").at("drafted_tokens") == 900,
+                      "speculative drafted-token count missing");
+    failures += check(done.at("speculative").at("accepted_tokens") == 720,
+                      "speculative accepted-token count missing");
     failures += check(done.at("speculative").at("fallback_steps") == 2,
                       "speculative fallback count missing");
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
+    failures += check(done.at("speculative").at("committed_tokens") == 1023,
+                      "speculative committed decode-token count missing");
+    failures +=
+        check(done.at("speculative").at("decode_seconds").get<double>() ==
+                  outcome.metrics.decode_seconds,
+              "speculative decode time missing or lost precision");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

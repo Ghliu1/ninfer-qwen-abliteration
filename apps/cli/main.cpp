@@ -265,6 +265,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache       = cli.kv_cache;
         engine_options.speculative    = cli.speculative;
+        engine_options.max_merged_vision_tokens = cli.max_merged_vision_tokens;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
         engine_options.load_progress  = load_progress.callback();

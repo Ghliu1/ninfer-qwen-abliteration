@@ -28,6 +28,13 @@ float coordinate(std::int32_t index, std::int32_t size) {
 
 } // namespace
 
+void validate_vision_control_limit(const VisionControl& control,
+                                   std::size_t max_merged_vision_tokens) {
+    if (control.merged_count > max_merged_vision_tokens) {
+        throw std::invalid_argument("vision request exceeds max_merged_vision_tokens");
+    }
+}
+
 VisionControl build_vision_control(const PreparedPromptData& prompt) {
     if (prompt.token_ids.size() != prompt.token_types.size()) {
         throw std::invalid_argument("vision control token types must cover the prompt");
@@ -147,6 +154,10 @@ VisionControl build_vision_control(const PreparedPromptData& prompt) {
             control.cu_seqlens.back() != checked_i32(item_patches, "item patch count")) {
             throw std::invalid_argument("vision item control metadata is incomplete");
         }
+        if (control.merged_count > std::numeric_limits<std::size_t>::max() - out.merged_count) {
+            throw std::overflow_error("vision control aggregate merged-token count overflows");
+        }
+        out.merged_count += control.merged_count;
         token_cursor += item_tokens;
         out.items.push_back(std::move(control));
         patch_cursor += item_patches;

@@ -191,6 +191,15 @@ void test_vision_control() {
 
     const q36::VisionControl control = q36::build_vision_control(prompt);
     expect(control.items.size() == 2, "Vision per-item control count");
+    expect(control.merged_count == 3,
+           "Vision control does not report the aggregate merged-token count");
+    q36::validate_vision_control_limit(control, 3);
+    bool aggregate_limit_rejected = false;
+    try {
+        q36::validate_vision_control_limit(control, 2);
+    } catch (const std::invalid_argument&) { aggregate_limit_rejected = true; }
+    expect(aggregate_limit_rejected,
+           "Vision control accepted an aggregate merged-token count above the limit");
     expect(control.items[0].patch_begin == 0 && control.items[0].patch_count == 4 &&
                control.items[0].merged_count == 1 && control.items[0].segment_length == 4 &&
                control.items[0].segment_count == 1 &&

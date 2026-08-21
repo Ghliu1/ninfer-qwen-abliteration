@@ -69,6 +69,28 @@ and `-r 1`, synchronizes after warmup, and brackets only the measured repetition
 `cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
 load, graph construction, and warmup do not enter topology counts.
 
+## Qwen3.8 capacity planner
+
+`qwen38-capacity-plan` calls the production Qwen3.8 NVFP4 sequence planner without loading model
+weights or issuing generation work. It prints exactly one JSON record to stdout; diagnostics go to
+stderr. `admissible` compares the complete sequence reservation plus the fixed 1 GiB safety floor
+with device memory free at the planning point.
+
+```bash
+./build/bench/qwen38-capacity-plan \
+  --max-context 204800 \
+  --kv-capacity 221184 \
+  --max-concurrency 2 \
+  --kv-dtype int8 \
+  --prefill-chunk 1024 \
+  --mtp-draft-tokens 3 \
+  --proposal-head optimized \
+  --max-merged-vision-tokens 4096 \
+  --cuda-graph on
+```
+
+The MTP draft window is fixed per invocation and must be in `1..5`.
+
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,

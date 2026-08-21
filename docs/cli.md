@@ -40,7 +40,10 @@ GPU residency is frozen when the Engine starts:
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
-- `--vision` loads those allocations and enables image/video input.
+- `--vision` loads those allocations and enables image/video input;
+- `--max-merged-vision-tokens N` bounds the aggregate merged Vision tokens in one request and
+  freezes the matching workspace/transient envelope at startup. It defaults to `32768`, accepts
+  `1..32768`, and is valid only with `--vision`.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
 text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
@@ -80,7 +83,8 @@ Run message files from the repository root when they contain repository-relative
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
-  --vision
+  --vision \
+  --max-merged-vision-tokens 4096
 ```
 
 Supported roles are `system`, `developer`, `user`, `assistant`, and `tool`.
@@ -145,6 +149,7 @@ measured recommendation rather than a semantic limit.
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--max-merged-vision-tokens N` | aggregate merged Vision-token envelope; requires `--vision` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
@@ -200,7 +205,9 @@ separate CUDA Graph driver allowance. Scratch is the maximum of the enabled Text
 Vision phases, not their sum. Its prefill bound uses
 `min(--prefill-chunk,--max-context)`. The request-transient buffer is also frozen at startup; a
 media request activates only the needed prefix and performs no project-owned device allocation or
-growth.
+growth. Vision planning uses `min(--max-context,--max-merged-vision-tokens)`; request admission
+sums merged tokens across every image and video item and rejects an over-limit aggregate before
+GPU execution.
 
 All weight, sequence, workspace, request-transient, and graph allocations are released when the
 Engine is destroyed.

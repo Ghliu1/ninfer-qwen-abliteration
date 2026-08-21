@@ -126,6 +126,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     if (prompt.has_media()) {
         auto control =
             std::make_shared<qwen3_6::VisionControl>(qwen3_6::build_vision_control(prompt));
+        qwen3_6::validate_vision_control_limit(*control, max_merged_vision_tokens);
         std::size_t max_merged     = 0;
         std::uint32_t previous_end = 0;
         for (const qwen3_6::VisionItemControl& item : control->items) {

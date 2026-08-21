@@ -33,6 +33,8 @@ int main() {
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
+    failures += check(defaults.max_merged_vision_tokens == 32768,
+                      "merged Vision limit default changed");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
@@ -98,6 +100,8 @@ int main() {
                                            "model.ninfer",
                                            "--no-prefix-reuse",
                                            "--vision",
+                                           "--max-merged-vision-tokens",
+                                           "4096",
                                            "--max-concurrency",
                                            "4",
                                            "--max-pending-requests",
@@ -120,6 +124,8 @@ int main() {
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
+    failures += check(configured.max_merged_vision_tokens == 4096,
+                      "--max-merged-vision-tokens did not reach serving options");
     failures +=
         check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
     failures +=
@@ -138,6 +144,23 @@ int main() {
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,
                       "media preparation limits did not reach serving options");
+
+
+    bool vision_limit_without_vision_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--max-merged-vision-tokens", "4096"});
+    } catch (const std::invalid_argument&) { vision_limit_without_vision_rejected = true; }
+    failures += check(vision_limit_without_vision_rejected,
+                      "merged Vision limit was accepted without --vision");
+    for (const std::string value : {"0", "32769", "bad"}) {
+        bool invalid_vision_limit_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--vision",
+                         "--max-merged-vision-tokens", value});
+        } catch (const std::invalid_argument&) { invalid_vision_limit_rejected = true; }
+        failures += check(invalid_vision_limit_rejected,
+                          "invalid merged Vision limit was accepted");
+    }
 
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
@@ -191,6 +214,9 @@ int main() {
               "serve help omits --preserve-thinking");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
+    failures += check(serve_usage_text("ninfer-serve").find("--max-merged-vision-tokens") !=
+                          std::string::npos,
+                      "serve help omits the merged Vision limit");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");

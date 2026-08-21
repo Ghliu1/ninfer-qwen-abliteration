@@ -73,6 +73,18 @@ target_include_directories(ninfer_bench PRIVATE
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
 
+# Authoritative Qwen3.8 NVFP4 sequence-capacity planner. It calls the production planner without
+# loading model weights or issuing generation work and emits one machine-readable JSON record.
+add_executable(qwen38_capacity_plan targets/qwen3_6_27b/capacity_plan.cpp)
+target_include_directories(qwen38_capacity_plan PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(qwen38_capacity_plan PRIVATE ninfer_engine CUDA::cudart)
+set_target_properties(qwen38_capacity_plan PROPERTIES OUTPUT_NAME qwen38-capacity-plan)
+
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.
 add_executable(ninfer_qwen3_6_27b_mtp_round_bench

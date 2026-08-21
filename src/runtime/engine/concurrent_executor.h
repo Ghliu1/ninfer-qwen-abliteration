@@ -437,6 +437,9 @@ private:
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);
+            result.speculative.committed_tokens =
+                result.generated_token_ids.empty() ? 0 : result.generated_token_ids.size() - 1U;
+            result.speculative.decode_seconds = result.timings.decode_seconds;
         }
         if (request->first_token) {
             result.timings.first_token_seconds =

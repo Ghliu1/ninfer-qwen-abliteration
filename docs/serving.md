@@ -33,7 +33,9 @@ select or alter the artifact.
 Vision is disabled by default: its weights, Vision scratch phase, and frozen request-transient
 buffer are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
-server must accept image or video input. Speculative residency is likewise frozen by
+server must accept image or video input. `--max-merged-vision-tokens N` selects the aggregate
+per-request Vision envelope (`1..32768`, default `32768`) and is valid only with `--vision`.
+Speculative residency is likewise frozen by
 `--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash is 35B-A3B text-only and
 cannot be combined with `--vision`. A later request cannot enable a capability omitted at startup.
@@ -137,10 +139,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
-media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
-has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
-`min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
-through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
+media-token expansion, the result must fit Engine `--max-context`. The Vision runtime accepts an
+explicit aggregate merged-token envelope through `--max-merged-vision-tokens`; the default is
+32,768 merged tokens (131,072 raw patches), and the effective planning limit is
+`min(--max-context,--max-merged-vision-tokens)`. The runtime sums merged tokens across every image
+and video item in the request and rejects an over-limit aggregate before GPU execution. There is no
+fixed image/video item-count limit: item count is admitted through aggregate source-byte,
+decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
 pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media
@@ -476,6 +481,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
+| `--max-merged-vision-tokens N` | aggregate merged Vision-token envelope; requires `--vision` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |

@@ -68,6 +68,8 @@ struct SpeculativeOptions {
     ProposalHead proposal_head = ProposalHead::Full;
 };
 
+inline constexpr std::uint32_t kDefaultMaxMergedVisionTokens = 32768;
+
 struct LoadProgress {
     std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
 };
@@ -88,6 +90,7 @@ struct EngineOptions {
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
+    std::uint32_t max_merged_vision_tokens = kDefaultMaxMergedVisionTokens;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
     LoadProgress load_progress;
@@ -381,6 +384,8 @@ struct SpeculativeStats {
     std::uint64_t drafted_tokens  = 0;
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
+    std::uint64_t committed_tokens = 0;
+    double decode_seconds           = 0.0;
     std::vector<std::uint64_t> accepted_per_position;
 };
 

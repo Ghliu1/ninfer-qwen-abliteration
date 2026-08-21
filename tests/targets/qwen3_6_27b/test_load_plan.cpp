@@ -197,6 +197,10 @@ int verify_profile_mismatch_rejection() {
 } // namespace
 
 int main() {
+    ninfer::SpeculativeStats fixed_mtp_stats;
+    fixed_mtp_stats.committed_tokens = 17;
+    fixed_mtp_stats.decode_seconds   = 1.25;
+
     const std::filesystem::path groupwise =
         artifact_path("NINFER_QWEN3_6_27B_WEIGHTS", "qwen3_6_27b.ninfer");
     const std::filesystem::path nvfp4 =

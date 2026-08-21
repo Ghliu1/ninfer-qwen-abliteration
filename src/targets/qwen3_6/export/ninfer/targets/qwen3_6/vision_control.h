@@ -25,8 +25,11 @@ struct VisionItemControl {
 
 struct VisionControl {
     std::vector<VisionItemControl> items;
+    std::size_t merged_count = 0;
 };
 
 [[nodiscard]] VisionControl build_vision_control(const PreparedPromptData& prompt);
+void validate_vision_control_limit(const VisionControl& control,
+                                   std::size_t max_merged_vision_tokens);
 
 } // namespace ninfer::targets::qwen3_6

@@ -59,8 +59,10 @@ public:
     [[nodiscard]] std::uint32_t kv_capacity() const noexcept;
     [[nodiscard]] std::uint32_t max_concurrency() const noexcept;
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
+    [[nodiscard]] std::size_t persistent_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t request_transient_capacity_bytes() const noexcept;
+    [[nodiscard]] std::size_t graph_allowance_bytes() const noexcept;
 
 public:
     // Family-private construction/storage seam; exact packages expose only the completed alias.
