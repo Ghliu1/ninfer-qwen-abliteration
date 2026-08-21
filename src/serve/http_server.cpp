@@ -225,7 +225,8 @@ void HttpServer::register_routes() {
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        if (options_.api_key.empty() || req.path == "/health" ||
+            req.path == "/health/ready" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -268,6 +269,9 @@ void HttpServer::register_routes() {
 
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    });
+    server_.Get("/health/ready", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"status", "ready"}}.dump(), "application/json");
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);

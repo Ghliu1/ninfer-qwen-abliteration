@@ -45,6 +45,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
+| `GET /health/ready` | server readiness; reachable only after model load and warm-up |
 | `GET /v1/models` | configured OpenAI model alias |
 | `GET /v1/models/{id}` | lookup of the configured alias |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -443,7 +444,8 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
-`x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated.
+`x-api-key` header. `GET /health`, `GET /health/ready`, and CORS preflight requests remain
+unauthenticated.
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
